@@ -12,16 +12,18 @@
 - 工具调用进度实时展示
 - 需要用户确认时展示交互按钮（CHOICE_REQUEST）
 - 会话持久化，重启后自动恢复上次对话
+- 通过 lark-cli 访问飞书空间（日历、文档、消息等）
 
 **斜杠指令：**
 
 | 指令 | 说明 |
 |------|------|
 | `/help` | 显示帮助 |
-| `/new` | 新建会话 |
+| `/new` / `/reset` | 新建会话（清空上下文） |
 | `/context` | 查看当前会话摘要 |
 | `/compact` | 压缩会话上下文（节省 token） |
 | `/sessions` | 查看历史会话并切换 |
+| `/models` | 查看可用模型并切换 |
 
 ## 快速开始
 
@@ -55,6 +57,7 @@ cp .env.example .env
 
 **选填：**
 - `AGENT_OWNER`：你的名字，写入 system prompt（默认 `user`）
+- `ANTHROPIC_DEFAULT_SONNET_MODEL` / `OPUS` / `HAIKU`：网关模型别名，供 `/models` 指令使用
 
 ### 4. 配置飞书机器人
 
@@ -63,8 +66,24 @@ cp .env.example .env
 1. **权限**：开通 `im:message`、`im:message.group_at_msg`、`contact:user.base:readonly`
 2. **事件订阅**：添加 `接收消息` 事件（`im.message.receive_v1`），传输协议选**长连接**
 3. **机器人**：在应用功能中启用机器人
+4. **互动卡片**：在应用功能中启用「互动卡片」——**缺少此项则按钮/下拉框点击无效（报错 200340）**
 
-### 5. 运行
+### 5. 配置 lark-cli（可选，用于访问飞书空间）
+
+lark-cli 让 Agent 可以操作飞书日历、文档、知识库等。
+
+```bash
+# 安装（需要 Node.js 16+）
+npm install -g @larksuite/cli
+
+# ⚠️ 必须与飞书机器人使用同一套 App ID / Secret
+lark-cli config init --app-id <FEISHU_APP_ID> --app-secret-stdin --brand feishu
+
+# 授权个人账号（每台新服务器执行一次）
+lark-cli auth login
+```
+
+### 6. 运行
 
 ```bash
 uv run python -m src
