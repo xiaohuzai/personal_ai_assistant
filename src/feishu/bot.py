@@ -21,10 +21,8 @@
   AGENT_OWNER          用户标识（默认 user）
 """
 import asyncio
-import dataclasses
 import json
 import logging
-import os
 import threading
 import time
 import uuid
@@ -43,6 +41,7 @@ from lark_oapi.event.callback.model.p2_card_action_trigger import (
 from .feishu_client import FeishuClient
 from . import card as cards
 from ..agent import assistant, session as session_store
+from ..agent.assistant import AVAILABLE_MODELS, get_current_model, set_model
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +72,7 @@ def _mark_processed(msg_id: str) -> bool:
 # 替代 Redis，用带过期时间的内存字典管理待处理状态
 _pending_choices: TTLCache = TTLCache(maxsize=1_000, ttl=600)
 _pending_sessions: TTLCache = TTLCache(maxsize=1_000, ttl=600)
+_pending_models: TTLCache = TTLCache(maxsize=1_000, ttl=600)
 _pending_lock = threading.Lock()
 
 
@@ -94,6 +94,15 @@ class _PendingSessionSwitch:
     chat_type: str
     card_msg_id: str
     sessions: list[dict]
+
+
+@dataclass
+class _PendingModelSwitch:
+    open_id: str
+    source_msg_id: Optional[str]
+    chat_type: str
+    card_msg_id: str
+    models: list[dict]
 
 
 def _store_pending_choice(token: str, pending: _PendingChoice) -> None:
@@ -124,6 +133,21 @@ def _pop_pending_session_switch(token: str) -> Optional[_PendingSessionSwitch]:
 def _peek_pending_session_switch(token: str) -> Optional[_PendingSessionSwitch]:
     with _pending_lock:
         return _pending_sessions.get(token)
+
+
+def _store_pending_model_switch(token: str, pending: _PendingModelSwitch) -> None:
+    with _pending_lock:
+        _pending_models[token] = pending
+
+
+def _pop_pending_model_switch(token: str) -> Optional[_PendingModelSwitch]:
+    with _pending_lock:
+        return _pending_models.pop(token, None)
+
+
+def _peek_pending_model_switch(token: str) -> Optional[_PendingModelSwitch]:
+    with _pending_lock:
+        return _pending_models.get(token)
 
 
 # ─────────────────── 提交协程到后台事件循环 ──────────────────────
@@ -437,7 +461,28 @@ async def _process_sessions_async(
         logger.error("sessions 处理异常: open_id=%s error=%s", open_id, e, exc_info=True)
 
 
-# ──────────────────────── 飞书事件回调 ───────────────────────────
+async def _process_models_async(
+    open_id: str,
+    chat_type: str = "p2p",
+    source_msg_id: Optional[str] = None,
+) -> None:
+    """拉取可用模型列表，发送交互式切换卡片。"""
+    try:
+        current_model = await asyncio.to_thread(get_current_model)
+        models = AVAILABLE_MODELS
+        token = str(uuid.uuid4())
+        card = cards.build_models_card(models, current_model, token)
+        card_msg_id = await _send_card(open_id, card, chat_type, source_msg_id)
+        if card_msg_id:
+            _store_pending_model_switch(token, _PendingModelSwitch(
+                open_id=open_id,
+                source_msg_id=source_msg_id,
+                chat_type=chat_type,
+                card_msg_id=card_msg_id,
+                models=models,
+            ))
+    except Exception as e:
+        logger.error("models 处理异常: open_id=%s error=%s", open_id, e, exc_info=True)
 
 def _on_card_action(data: P2CardActionTrigger) -> P2CardActionTriggerResponse:
     """飞书卡片按钮点击回调，必须在超时前返回响应。"""
@@ -453,13 +498,19 @@ async def _on_card_action_async(data: P2CardActionTrigger) -> P2CardActionTrigge
         value = (data.event.action.value or {}) if data.event and data.event.action else {}
         token = value.get("token")
         action = value.get("action", "choice")
+        # select_static 的选中值在 action.option；部分场景也可能合并进 value
+        option = getattr(data.event.action, "option", None) if data.event and data.event.action else None
 
         operator = data.event.operator if data.event else None
         clicker_open_id = operator.open_id if operator else None
 
+        logger.info("card action: action=%s token=%s option=%s clicker=%s value=%s",
+                    action, token, option, clicker_open_id, value)
+
         if action == "switch_session":
-            option = getattr(data.event.action, "option", None) if data.event and data.event.action else None
             return await _handle_switch_session_action_async(clicker_open_id, value, token, option)
+        elif action == "switch_model":
+            return await _handle_switch_model_action_async(clicker_open_id, value, token, option)
         else:
             return await _handle_choice_action_async(clicker_open_id, value, token)
 
@@ -500,7 +551,7 @@ async def _handle_choice_action_async(
     resp = P2CardActionTriggerResponse()
     resp.card = CallBackCard()
     resp.card.type = "raw"
-    resp.card.data = chosen_card
+    resp.card.data = json.dumps(chosen_card, ensure_ascii=False)
     return resp
 
 
@@ -533,7 +584,40 @@ async def _handle_switch_session_action_async(
     resp = P2CardActionTriggerResponse()
     resp.card = CallBackCard()
     resp.card.type = "raw"
-    resp.card.data = switched_card
+    resp.card.data = json.dumps(switched_card, ensure_ascii=False)
+    return resp
+
+
+async def _handle_switch_model_action_async(
+    clicker_open_id: Optional[str],
+    value: dict,
+    token: Optional[str],
+    option: Optional[str] = None,
+) -> P2CardActionTriggerResponse:
+    model_id = option or value.get("model_id")
+    if not token or not model_id:
+        return P2CardActionTriggerResponse()
+
+    pending = _peek_pending_model_switch(token)
+    if not pending:
+        return P2CardActionTriggerResponse()
+
+    if clicker_open_id != pending.open_id:
+        logger.warning("switch_model 被非所有者点击: clicker=%s owner=%s", clicker_open_id, pending.open_id)
+        return P2CardActionTriggerResponse()
+
+    pending = _pop_pending_model_switch(token)
+    if not pending:
+        return P2CardActionTriggerResponse()
+
+    await asyncio.to_thread(set_model, model_id)
+    logger.info("switched model: open_id=%s model=%s", pending.open_id, model_id)
+
+    switched_card = cards.build_model_switched_card(model_id)
+    resp = P2CardActionTriggerResponse()
+    resp.card = CallBackCard()
+    resp.card.type = "raw"
+    resp.card.data = json.dumps(switched_card, ensure_ascii=False)
     return resp
 
 
@@ -628,6 +712,9 @@ def _on_message_receive(data: P2ImMessageReceiveV1) -> None:
     if cmd == "/sessions":
         _submit(_process_sessions_async(open_id, chat_type, source_msg_id))
         return
+    if cmd == "/models":
+        _submit(_process_models_async(open_id, chat_type, source_msg_id))
+        return
     if cmd in ("/compact", "/context"):
         _submit(_process_slash_async(open_id, cmd, chat_type, source_msg_id))
         return
@@ -651,6 +738,7 @@ def start(app_id: str, app_secret: str) -> None:
     handler = (
         lark.EventDispatcherHandler.builder("", "")
         .register_p2_im_message_receive_v1(_on_message_receive)
+        .register_p2_im_message_message_read_v1(lambda _: None)
         .register_p2_card_action_trigger(_on_card_action)
         .build()
     )

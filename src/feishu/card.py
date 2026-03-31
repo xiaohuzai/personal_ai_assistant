@@ -81,7 +81,8 @@ def build_help_card() -> dict:
         "| `/new` | 新建会话（清空历史上下文） |\n"
         "| `/context` | 查看当前会话的上下文摘要 |\n"
         "| `/compact` | 压缩当前会话上下文（节省 token） |\n"
-        "| `/sessions` | 查看历史会话并切换 |\n\n"
+        "| `/sessions` | 查看历史会话并切换 |\n"
+        "| `/models` | 查看可用模型并切换 |\n\n"
         "💡 直接发送消息即可与 Agent 对话。"
     )
     return {
@@ -169,6 +170,61 @@ def build_session_switched_card(sessions: list[dict], switched_to_id: str) -> di
         "body": {
             "elements": [
                 {"tag": "markdown", "content": f"已切换到：{detail}\n\n下条消息将在此会话中继续。"},
+            ]
+        },
+    }
+
+
+def build_models_card(
+    models: list[dict],
+    current_model: str,
+    token: str,
+) -> dict:
+    """构建模型切换卡片：下拉选择框 + 确认弹窗。"""
+    options = []
+    for m in models:
+        mid = m["id"]
+        label = f"{'✅ ' if mid == current_model else ''}{m.get('name', mid)}"
+        options.append({"text": {"tag": "plain_text", "content": label}, "value": mid})
+
+    current_hint = f"当前：`{current_model}`" if current_model else "当前：默认模型"
+    elements: list[dict] = [
+        {"tag": "markdown", "content": current_hint},
+        {
+            "tag": "select_static",
+            "placeholder": {"tag": "plain_text", "content": "选择模型..."},
+            "initial_option": current_model or (models[0]["id"] if models else ""),
+            "options": options,
+            "value": {"action": "switch_model", "token": token},
+            "confirm": {
+                "title": {"tag": "plain_text", "content": "确认切换模型"},
+                "text": {"tag": "plain_text", "content": "切换后下条消息将使用所选模型。"},
+            },
+        },
+    ]
+    return {
+        "schema": "2.0",
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "title": {"tag": "plain_text", "content": f"切换模型（共 {len(models)} 个可用）"},
+            "template": "purple",
+        },
+        "body": {"elements": elements},
+    }
+
+
+def build_model_switched_card(model_id: str) -> dict:
+    """模型切换成功后的确认卡片。"""
+    return {
+        "schema": "2.0",
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "title": {"tag": "plain_text", "content": "✅ 已切换模型"},
+            "template": "green",
+        },
+        "body": {
+            "elements": [
+                {"tag": "markdown", "content": f"已切换到：`{model_id}`\n\n下条消息将使用此模型。"},
             ]
         },
     }

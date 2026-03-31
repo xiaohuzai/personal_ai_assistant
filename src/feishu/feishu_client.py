@@ -12,7 +12,6 @@ from lark_oapi.api.contact.v3 import GetUserRequest
 from lark_oapi.api.im.v1 import (
     CreateMessageRequest,
     CreateMessageRequestBody,
-    DeleteMessageRequest,
     GetMessageResourceRequest,
     PatchMessageRequest,
     PatchMessageRequestBody,
@@ -199,19 +198,6 @@ class FeishuClient:
             return True
         logger.error(
             "更新卡片失败: message_id=%s, code=%s, msg=%s",
-            message_id, response.code, response.msg,
-        )
-        return False
-
-    def recall_message(self, message_id: str) -> bool:
-        """撤回指定消息（发送后 24 小时内有效）。"""
-        request = DeleteMessageRequest.builder().message_id(message_id).build()
-        response = self._client.im.v1.message.delete(request)
-        if response.success():
-            logger.info("消息撤回成功: message_id=%s", message_id)
-            return True
-        logger.error(
-            "消息撤回失败: message_id=%s, code=%s, msg=%s",
             message_id, response.code, response.msg,
         )
         return False

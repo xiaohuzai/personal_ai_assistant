@@ -3,6 +3,7 @@ Personal AI Assistant — 入口
 
 加载 .env，配置日志，启动飞书机器人。
 """
+import asyncio
 import logging
 import os
 
@@ -31,10 +32,10 @@ def main() -> None:
     if missing:
         raise EnvironmentError(f"缺少必要环境变量：{', '.join(missing)}")
 
-    # 初始化 workspace 目录
-    from .agent.assistant import WORKSPACE, _load_agent_env
+    # 初始化：加载持久化 env、配置 lark-cli
+    from .agent.assistant import WORKSPACE, initialize
     os.makedirs(WORKSPACE, exist_ok=True)
-    _load_agent_env()
+    asyncio.run(initialize())
     logger.info("Workspace: %s", WORKSPACE)
 
     from .feishu.bot import start
