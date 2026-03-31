@@ -435,12 +435,25 @@ async def run_slash(open_id: str, command: str) -> dict:
 
 _PROJECT_SETTINGS_PATH = os.path.join(WORKSPACE, ".claude", "settings.json")
 
-# 预设可选模型列表（用于 /models 卡片）
-AVAILABLE_MODELS: list[dict] = [
-    {"id": "claude-sonnet-4-6",  "name": "Claude Sonnet 4.6（默认）"},
-    {"id": "claude-opus-4-6",    "name": "Claude Opus 4.6（最强）"},
-    {"id": "claude-haiku-4-5-20251001", "name": "Claude Haiku 4.5（最快）"},
-]
+# 可选模型列表（用于 /models 卡片）
+# 优先读 .env 里的网关别名，保证发给网关的 model ID 与网关配置一致；
+# 未配置时回退到 Anthropic 官方 ID。
+def _build_available_models() -> list[dict]:
+    entries = [
+        (os.environ.get("ANTHROPIC_DEFAULT_SONNET_MODEL", "claude-sonnet-4-6"), "Claude Sonnet（默认）"),
+        (os.environ.get("ANTHROPIC_DEFAULT_OPUS_MODEL",   "claude-opus-4-6"),   "Claude Opus（最强）"),
+        (os.environ.get("ANTHROPIC_DEFAULT_HAIKU_MODEL",  "claude-haiku-4-5-20251001"), "Claude Haiku（最快）"),
+    ]
+    seen: set[str] = set()
+    result: list[dict] = []
+    for model_id, name in entries:
+        if model_id and model_id not in seen:
+            result.append({"id": model_id, "name": f"{name} · {model_id}"})
+            seen.add(model_id)
+    return result
+
+
+AVAILABLE_MODELS: list[dict] = _build_available_models()
 
 
 def get_current_model() -> str:

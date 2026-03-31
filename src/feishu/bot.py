@@ -498,15 +498,18 @@ async def _on_card_action_async(data: P2CardActionTrigger) -> P2CardActionTrigge
         value = (data.event.action.value or {}) if data.event and data.event.action else {}
         token = value.get("token")
         action = value.get("action", "choice")
+        # select_static 的选中值在 action.option；部分场景也可能合并进 value
+        option = getattr(data.event.action, "option", None) if data.event and data.event.action else None
 
         operator = data.event.operator if data.event else None
         clicker_open_id = operator.open_id if operator else None
 
+        logger.info("card action: action=%s token=%s option=%s clicker=%s value=%s",
+                    action, token, option, clicker_open_id, value)
+
         if action == "switch_session":
-            option = getattr(data.event.action, "option", None) if data.event and data.event.action else None
             return await _handle_switch_session_action_async(clicker_open_id, value, token, option)
         elif action == "switch_model":
-            option = getattr(data.event.action, "option", None) if data.event and data.event.action else None
             return await _handle_switch_model_action_async(clicker_open_id, value, token, option)
         else:
             return await _handle_choice_action_async(clicker_open_id, value, token)
@@ -548,7 +551,7 @@ async def _handle_choice_action_async(
     resp = P2CardActionTriggerResponse()
     resp.card = CallBackCard()
     resp.card.type = "raw"
-    resp.card.data = chosen_card
+    resp.card.data = json.dumps(chosen_card, ensure_ascii=False)
     return resp
 
 
@@ -581,7 +584,7 @@ async def _handle_switch_session_action_async(
     resp = P2CardActionTriggerResponse()
     resp.card = CallBackCard()
     resp.card.type = "raw"
-    resp.card.data = switched_card
+    resp.card.data = json.dumps(switched_card, ensure_ascii=False)
     return resp
 
 
@@ -614,7 +617,7 @@ async def _handle_switch_model_action_async(
     resp = P2CardActionTriggerResponse()
     resp.card = CallBackCard()
     resp.card.type = "raw"
-    resp.card.data = switched_card
+    resp.card.data = json.dumps(switched_card, ensure_ascii=False)
     return resp
 
 
