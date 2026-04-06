@@ -8,6 +8,25 @@ from datetime import datetime
 from typing import Optional
 
 
+def build_thinking_card(text: str, stop_token: str) -> dict:
+    """构建思考中/执行中卡片，含进度文本和 ⏹ 停止按钮（danger 样式）。"""
+    return {
+        "schema": "2.0",
+        "config": {"wide_screen_mode": True},
+        "body": {
+            "elements": [
+                {"tag": "markdown", "content": text},
+                {
+                    "tag": "button",
+                    "text": {"tag": "plain_text", "content": "⏹ 停止"},
+                    "type": "danger",
+                    "value": {"action": "stop", "token": stop_token},
+                },
+            ],
+        },
+    }
+
+
 def build_text_card(
     text: str,
     title: Optional[str] = None,
