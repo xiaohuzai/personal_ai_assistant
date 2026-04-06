@@ -73,7 +73,11 @@ def _mark_processed(msg_id: str) -> bool:
 _pending_choices: TTLCache = TTLCache(maxsize=1_000, ttl=600)
 _pending_sessions: TTLCache = TTLCache(maxsize=1_000, ttl=600)
 _pending_models: TTLCache = TTLCache(maxsize=1_000, ttl=600)
+_pending_stops: TTLCache = TTLCache(maxsize=1_000, ttl=600)
 _pending_lock = threading.Lock()
+
+# stop_token → asyncio.Task，用于精确取消运行中的 query；操作全在同一事件循环中，无需锁
+_running_tasks: dict[str, "asyncio.Task"] = {}
 
 
 @dataclass
@@ -103,6 +107,12 @@ class _PendingModelSwitch:
     chat_type: str
     card_msg_id: str
     models: list[dict]
+
+
+@dataclass
+class _PendingStop:
+    open_id: str
+    stop_token: str   # 与 _running_tasks key 一致，用于精确取消
 
 
 def _store_pending_choice(token: str, pending: _PendingChoice) -> None:
@@ -148,6 +158,21 @@ def _pop_pending_model_switch(token: str) -> Optional[_PendingModelSwitch]:
 def _peek_pending_model_switch(token: str) -> Optional[_PendingModelSwitch]:
     with _pending_lock:
         return _pending_models.get(token)
+
+
+def _store_pending_stop(token: str, pending: _PendingStop) -> None:
+    with _pending_lock:
+        _pending_stops[token] = pending
+
+
+def _pop_pending_stop(token: str) -> Optional[_PendingStop]:
+    with _pending_lock:
+        return _pending_stops.pop(token, None)
+
+
+def _peek_pending_stop(token: str) -> Optional[_PendingStop]:
+    with _pending_lock:
+        return _pending_stops.get(token)
 
 
 # ─────────────────── 提交协程到后台事件循环 ──────────────────────
@@ -309,6 +334,13 @@ async def _process_message_async(
     meta: Optional[dict] = None,
 ) -> None:
     """异步协程：（下载图片/文件）→ 发占位卡片 → 调用 Agent → 打字机更新卡片。"""
+    # 生成 stop_token，注册运行中任务，支持 ⏹ 停止按钮
+    stop_token = str(uuid.uuid4())
+    _store_pending_stop(stop_token, _PendingStop(open_id=open_id, stop_token=stop_token))
+    task = asyncio.current_task()
+    if task:
+        _running_tasks[stop_token] = task
+
     try:
         # 0a. 下载图片
         images: list[dict] = []
@@ -328,11 +360,11 @@ async def _process_message_async(
                 else:
                     logger.warning("飞书文件下载失败，跳过: file_key=%s", file_key)
 
-        # 1. 发"思考中"占位卡片
-        thinking_card = cards.build_text_card("⏳ 正在思考...", is_thinking=True)
+        # 1. 发"思考中"占位卡片（含 ⏹ 停止按钮）
+        thinking_card = cards.build_thinking_card("⏳ 正在思考...", stop_token)
         message_id = await _send_card(open_id, thinking_card, chat_type, source_msg_id)
 
-        # 2. 调用 Agent，实时更新占位卡片（工具调用进度）
+        # 2. 调用 Agent，实时更新占位卡片（工具调用进度，含 ⏹ 停止按钮）
         last_tool_update = 0.0
 
         async def on_tool_use(tool_name: str) -> None:
@@ -342,10 +374,13 @@ async def _process_message_async(
             now = time.monotonic()
             if now - last_tool_update > 2.0:
                 last_tool_update = now
-                progress = cards.build_text_card(f"⚙️ 正在执行 {tool_name}...", is_thinking=True)
-                await asyncio.to_thread(_feishu.update_card, message_id, progress)
+                progress = cards.build_thinking_card(f"⚙️ 正在执行 {tool_name}...", stop_token)
+                # fire-and-forget：不阻塞主任务，task.cancel() 可立即注入 CancelledError
+                asyncio.ensure_future(asyncio.to_thread(_feishu.update_card, message_id, progress))
 
         choice_request = None
+        interrupted = False
+        reply = "（无回复）"
         try:
             resp_data = await assistant.run_message(
                 open_id=open_id,
@@ -359,9 +394,21 @@ async def _process_message_async(
             choice_request = resp_data.get("choice_request")
             logger.info("Agent 响应: open_id=%s reply_len=%d choice_request=%s",
                         open_id, len(reply), choice_request is not None)
+        except asyncio.CancelledError:
+            interrupted = True
+            logger.info("任务被停止: open_id=%s stop_token=%s", open_id, stop_token)
         except Exception as e:
             logger.error("Agent 调用失败: open_id=%s, error=%s", open_id, e)
             reply = f"❌ 服务暂时不可用，请稍后重试。\n\n`{e}`"
+
+        # 任务被中断时更新卡片并退出
+        if interrupted:
+            if message_id:
+                try:
+                    await asyncio.to_thread(_feishu.update_card, message_id, cards.build_text_card("⏹ 已中断"))
+                except Exception:
+                    pass
+            return
 
         # 3. 更新卡片（choice 或普通文字）
         if choice_request:
@@ -391,6 +438,9 @@ async def _process_message_async(
 
     except Exception as e:
         logger.error("消息处理异常: open_id=%s, error=%s", open_id, e, exc_info=True)
+    finally:
+        _running_tasks.pop(stop_token, None)
+        _pop_pending_stop(stop_token)
 
 
 async def _process_reset_async(
@@ -507,7 +557,9 @@ async def _on_card_action_async(data: P2CardActionTrigger) -> P2CardActionTrigge
         logger.info("card action: action=%s token=%s option=%s clicker=%s value=%s",
                     action, token, option, clicker_open_id, value)
 
-        if action == "switch_session":
+        if action == "stop":
+            return await _handle_stop_action_async(clicker_open_id, token)
+        elif action == "switch_session":
             return await _handle_switch_session_action_async(clicker_open_id, value, token, option)
         elif action == "switch_model":
             return await _handle_switch_model_action_async(clicker_open_id, value, token, option)
@@ -517,6 +569,40 @@ async def _on_card_action_async(data: P2CardActionTrigger) -> P2CardActionTrigge
     except Exception as e:
         logger.error("card action 处理异常: %s", e, exc_info=True)
     return P2CardActionTriggerResponse()
+
+
+async def _handle_stop_action_async(
+    clicker_open_id: Optional[str],
+    token: Optional[str],
+) -> P2CardActionTriggerResponse:
+    """处理 ⏹ 停止按钮点击：校验 owner → 取消 asyncio 任务 → 立即返回已中断卡片。"""
+    if not token:
+        return P2CardActionTriggerResponse()
+
+    pending = _peek_pending_stop(token)
+    if not pending:
+        return P2CardActionTriggerResponse()
+
+    if clicker_open_id and clicker_open_id != pending.open_id:
+        logger.warning("stop action 被非所有者点击: clicker=%s owner=%s", clicker_open_id, pending.open_id)
+        return P2CardActionTriggerResponse()
+
+    pending = _pop_pending_stop(token)
+    if not pending:
+        return P2CardActionTriggerResponse()
+
+    # 取消对应的 asyncio 任务（非阻塞）
+    task = _running_tasks.pop(pending.stop_token, None)
+    if task:
+        task.cancel()
+    logger.info("stop action: open_id=%s stop_token=%s", pending.open_id, pending.stop_token)
+
+    interrupted_card = cards.build_text_card("⏹ 已中断")
+    resp = P2CardActionTriggerResponse()
+    resp.card = CallBackCard()
+    resp.card.type = "raw"
+    resp.card.data = json.dumps(interrupted_card, ensure_ascii=False)
+    return resp
 
 
 async def _handle_choice_action_async(
@@ -533,7 +619,7 @@ async def _handle_choice_action_async(
     if not pending:
         return P2CardActionTriggerResponse()
 
-    if clicker_open_id != pending.open_id:
+    if clicker_open_id and clicker_open_id != pending.open_id:
         logger.warning("choice action 被非所有者点击: clicker=%s owner=%s", clicker_open_id, pending.open_id)
         return P2CardActionTriggerResponse()
 
@@ -569,7 +655,7 @@ async def _handle_switch_session_action_async(
     if not pending:
         return P2CardActionTriggerResponse()
 
-    if clicker_open_id != pending.open_id:
+    if clicker_open_id and clicker_open_id != pending.open_id:
         logger.warning("switch_session 被非所有者点击: clicker=%s owner=%s", clicker_open_id, pending.open_id)
         return P2CardActionTriggerResponse()
 
@@ -602,7 +688,7 @@ async def _handle_switch_model_action_async(
     if not pending:
         return P2CardActionTriggerResponse()
 
-    if clicker_open_id != pending.open_id:
+    if clicker_open_id and clicker_open_id != pending.open_id:
         logger.warning("switch_model 被非所有者点击: clicker=%s owner=%s", clicker_open_id, pending.open_id)
         return P2CardActionTriggerResponse()
 
@@ -691,6 +777,7 @@ def _on_message_receive(data: P2ImMessageReceiveV1) -> None:
     meta: dict = {
         "chat_type": chat_type,
         "chat_id": message.chat_id,
+        "sender_open_id": open_id,
         "message_time": message.create_time,
     }
     if message.parent_id:

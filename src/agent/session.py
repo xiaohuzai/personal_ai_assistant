@@ -77,10 +77,19 @@ def clear_session(open_id: str) -> None:
     logger.info("session cleared: open_id=%s", open_id)
 
 
+def _sessions_dir(cwd: str) -> str:
+    """返回 Claude Code CLI 实际存储 session JSONL 的目录。
+    SDK 使用系统 HOME，路径为 ~/.claude/projects/{cwd_slug}/
+    CLI 的 slug 规则：将路径中所有非字母数字字符替换为 '-'
+    """
+    import re
+    project_slug = re.sub(r"[^a-zA-Z0-9]", "-", cwd)
+    return os.path.join(os.path.expanduser("~"), ".claude", "projects", project_slug)
+
+
 def session_exists(cwd: str, session_id: str) -> bool:
     """检查 session JSONL 文件是否存在于磁盘。"""
-    project_slug = cwd.replace("/", "-")
-    path = os.path.join(cwd, ".home", ".claude", "projects", project_slug, f"{session_id}.jsonl")
+    path = os.path.join(_sessions_dir(cwd), f"{session_id}.jsonl")
     return os.path.isfile(path)
 
 
@@ -111,8 +120,7 @@ def list_sessions(cwd: str) -> list[dict]:
     扫描 JSONL 文件，返回所有历史 session 列表，按最后修改时间倒序。
     每项格式：{"session_id": str, "updated_at": int, "preview": str}
     """
-    project_slug = cwd.replace("/", "-")
-    sessions_dir = os.path.join(cwd, ".home", ".claude", "projects", project_slug)
+    sessions_dir = _sessions_dir(cwd)
     results: list[dict] = []
     if not os.path.isdir(sessions_dir):
         return results
