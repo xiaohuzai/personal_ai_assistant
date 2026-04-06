@@ -583,7 +583,7 @@ async def _handle_stop_action_async(
     if not pending:
         return P2CardActionTriggerResponse()
 
-    if clicker_open_id != pending.open_id:
+    if clicker_open_id and clicker_open_id != pending.open_id:
         logger.warning("stop action 被非所有者点击: clicker=%s owner=%s", clicker_open_id, pending.open_id)
         return P2CardActionTriggerResponse()
 
@@ -619,7 +619,7 @@ async def _handle_choice_action_async(
     if not pending:
         return P2CardActionTriggerResponse()
 
-    if clicker_open_id != pending.open_id:
+    if clicker_open_id and clicker_open_id != pending.open_id:
         logger.warning("choice action 被非所有者点击: clicker=%s owner=%s", clicker_open_id, pending.open_id)
         return P2CardActionTriggerResponse()
 
@@ -655,7 +655,7 @@ async def _handle_switch_session_action_async(
     if not pending:
         return P2CardActionTriggerResponse()
 
-    if clicker_open_id != pending.open_id:
+    if clicker_open_id and clicker_open_id != pending.open_id:
         logger.warning("switch_session 被非所有者点击: clicker=%s owner=%s", clicker_open_id, pending.open_id)
         return P2CardActionTriggerResponse()
 
@@ -688,7 +688,7 @@ async def _handle_switch_model_action_async(
     if not pending:
         return P2CardActionTriggerResponse()
 
-    if clicker_open_id != pending.open_id:
+    if clicker_open_id and clicker_open_id != pending.open_id:
         logger.warning("switch_model 被非所有者点击: clicker=%s owner=%s", clicker_open_id, pending.open_id)
         return P2CardActionTriggerResponse()
 
