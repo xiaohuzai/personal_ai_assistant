@@ -401,6 +401,11 @@ async def _process_message_async(
             logger.error("Agent 调用失败: open_id=%s, error=%s", open_id, e)
             reply = f"❌ 服务暂时不可用，请稍后重试。\n\n`{e}`"
 
+        # Agent 调用已结束（成功/失败/中断），提前清理 stop_token。
+        # 此后点击停止按钮将因 token 不存在而静默忽略，避免打字机更新被意外取消。
+        _running_tasks.pop(stop_token, None)
+        _pop_pending_stop(stop_token)
+
         # 任务被中断时更新卡片并退出
         if interrupted:
             if message_id:
@@ -415,12 +420,16 @@ async def _process_message_async(
             token = str(uuid.uuid4())
             question = choice_request.get("question", "请选择：")
             choices = choice_request.get("choices", [])
+            logger.info("渲染选择卡片: open_id=%s question=%r choices=%s message_id=%s",
+                        open_id, question, choices, message_id)
             card = cards.build_choice_card(reply, question, choices, token)
             if message_id:
-                await asyncio.to_thread(_feishu.update_card, message_id, card)
+                ok = await asyncio.to_thread(_feishu.update_card, message_id, card)
+                logger.info("update_card 结果: message_id=%s ok=%s", message_id, ok)
                 new_card_id = message_id
             else:
                 new_card_id = await _send_card(open_id, card, chat_type, source_msg_id)
+                logger.info("send_card 结果: new_card_id=%s", new_card_id)
             if new_card_id:
                 _store_pending_choice(token, _PendingChoice(
                     open_id=open_id,
@@ -488,8 +497,13 @@ async def _process_sessions_async(
     """拉取历史 session 列表，发送交互式切换卡片。"""
     try:
         from ..agent.assistant import WORKSPACE
-        sessions = await asyncio.to_thread(session_store.list_sessions, WORKSPACE)
-        current_session_id = session_store.get_session(open_id)
+        try:
+            sessions = await asyncio.to_thread(session_store.list_sessions, WORKSPACE)
+            current_session_id = session_store.get_session(open_id)
+        except Exception as e:
+            await _send_card(open_id, cards.build_text_card(f"❌ 获取会话列表失败。\n\n`{e}`"),
+                             chat_type, source_msg_id)
+            return
 
         if not sessions:
             await _send_card(open_id, cards.build_text_card("📂 暂无历史会话。"),
@@ -520,6 +534,10 @@ async def _process_models_async(
     try:
         current_model = await asyncio.to_thread(get_current_model)
         models = AVAILABLE_MODELS
+        if not models:
+            await _send_card(open_id, cards.build_text_card("❌ 暂无可用模型。"),
+                             chat_type, source_msg_id)
+            return
         token = str(uuid.uuid4())
         card = cards.build_models_card(models, current_model, token)
         card_msg_id = await _send_card(open_id, card, chat_type, source_msg_id)
