@@ -374,15 +374,24 @@ async def run_message(
         if stderr_lines:
             logger.error("query stderr:\n%s", "\n".join(stderr_lines))
         logger.error("query failed: open_id=%s session=%s error=%s", open_id, session_id, e, exc_info=True)
-        raise
+        # 有部分输出时保留内容，附上中断提示，避免丢失已有结果
+        partial_text = "".join(reply_parts).strip()
+        if partial_text:
+            reply_parts = [partial_text + f"\n\n⚠️ 输出中断（{type(e).__name__}）"]
+        else:
+            raise
 
     if stderr_lines:
         logger.warning("query stderr:\n%s", "\n".join(stderr_lines))
 
+    _limit_msg = "⏸️ 任务进行中但工具调用已达上限（20 轮），请回复「继续」让我接着做。"
     _reply_text = "".join(reply_parts).strip()
-    if not _reply_text:
+    if stop_reason == "tool_use":
+        # max_turns 耗尽且最后一轮是工具调用，追加提示到已有输出末尾
+        _reply_text = (_reply_text + "\n\n" + _limit_msg) if _reply_text else _limit_msg
+    elif not _reply_text:
         if stop_reason == "max_turns":
-            _reply_text = "⏸️ 任务进行中但工具调用已达上限（20 轮），请回复「继续」让我接着做。"
+            _reply_text = _limit_msg
         else:
             _reply_text = "✅ 已完成（Claude 未输出文字回复）"
 
