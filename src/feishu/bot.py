@@ -23,6 +23,7 @@
 import asyncio
 import json
 import logging
+import os
 import threading
 import time
 import uuid
@@ -854,4 +855,9 @@ def start(app_id: str, app_secret: str) -> None:
         event_handler=handler,
         log_level=lark.LogLevel.INFO,
     )
+
+    # 两个客户端均已完成初始化并持有凭据副本，清理进程环境变量
+    # 防止 Claude 子进程（继承父进程 env）泄露 App Secret 给用户
+    os.environ.pop("FEISHU_APP_SECRET", None)
+
     ws_client.start()  # 阻塞，内部自动重连
