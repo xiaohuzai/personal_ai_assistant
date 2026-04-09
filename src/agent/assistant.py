@@ -209,11 +209,31 @@ async def _setup_lark_cli() -> Optional[str]:
         except (json.JSONDecodeError, AttributeError):
             pass
 
-    # 2. config 不存在时自动 config init
+    # 2. 检查 config 文件是否存在，且 appId 与环境变量一致；不存在或不一致则自动初始化
     app_id = os.environ.get("FEISHU_APP_ID", "")
     app_secret = os.environ.get("FEISHU_APP_SECRET", "")
     config_file = os.path.join(os.environ.get("HOME", os.path.expanduser("~")), ".lark-cli", "config.json")
-    if not os.path.exists(config_file):
+
+    need_init = True
+    if os.path.exists(config_file):
+        try:
+            with open(config_file) as _f:
+                _cfg = json.load(_f)
+            existing_app_id = (_cfg.get("apps") or [{}])[0].get("appId", "")
+            if existing_app_id == app_id:
+                need_init = False  # appId 一致，跳过 init
+            else:
+                logger.warning("lark-cli config appId 不匹配: config=%s env=%s，重新初始化",
+                               existing_app_id, app_id)
+                os.remove(config_file)
+        except Exception as exc:
+            logger.warning("lark-cli config 读取失败，重新初始化: %s", exc)
+            try:
+                os.remove(config_file)
+            except OSError:
+                pass
+
+    if need_init:
         if app_id and app_secret:
             rc_init, _, err_init = await _run(
                 "lark-cli", "config", "init",
