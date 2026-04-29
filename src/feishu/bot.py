@@ -274,8 +274,7 @@ def _resolve_mentions(text: str, raw_mentions: list) -> str:
 
 
 def _extract_post_content(content: dict) -> tuple[str, list[str]]:
-    """从富文本(post)消息中提取纯文本和图片 key 列表。委托给 FeishuClient._parse_post_content。"""
-    from .feishu_client import FeishuClient
+    """从富文本(post)消息中提取纯文本和图片 key 列表。"""
     return FeishuClient._parse_post_content(content)
 
 
@@ -476,6 +475,59 @@ async def _process_slash_async(
             await _send_card(open_id, cards.build_text_card(reply), chat_type, source_msg_id)
     except Exception as e:
         logger.error("slash 处理异常: open_id=%s command=%s error=%s", open_id, command, e, exc_info=True)
+
+
+async def _process_save_session_async(
+    open_id: str,
+    name: str,
+    chat_type: str = "p2p",
+    source_msg_id: Optional[str] = None,
+) -> None:
+    """/save <name> — 给当前 session 保存别名。"""
+    try:
+        current_session_id = session_store.get_session(open_id)
+        if not current_session_id:
+            await _send_card(open_id, cards.build_text_card("⚠️ 当前没有活跃会话，请先发送一条消息。"), chat_type, source_msg_id)
+            return
+        old_session_id = await asyncio.to_thread(session_store.save_session_name, name, current_session_id)
+        reply = f"✅ 已将当前会话保存为 **{name}**（`{current_session_id[:8]}`）\n\n使用 `/s {name} <消息>` 可在该会话内对话，不影响当前会话。"
+        if old_session_id:
+            reply += f"\n\n> ℹ️ 别名 **{name}** 原指向会话 `{old_session_id[:8]}`，已被覆盖。"
+        await _send_card(open_id, cards.build_text_card(reply), chat_type, source_msg_id)
+    except Exception as e:
+        logger.error("save session 处理异常: open_id=%s name=%s error=%s", open_id, name, e, exc_info=True)
+
+
+async def _process_named_session_message_async(
+    open_id: str,
+    name: str,
+    content: str,
+    chat_type: str = "p2p",
+    source_msg_id: Optional[str] = None,
+) -> None:
+    """/s <name> <msg> — 在指定 session 内发消息，不改变当前 session。"""
+    try:
+        session_id = await asyncio.to_thread(session_store.get_session_by_name, name)
+        if not session_id:
+            await _send_card(
+                open_id,
+                cards.build_text_card(f"⚠️ 未找到名为 **{name}** 的会话。\n\n使用 `/save {name}` 可将当前会话保存为此名称。"),
+                chat_type, source_msg_id,
+            )
+            return
+        # 暂存当前 session，切换到命名 session，执行后恢复
+        original_session_id = session_store.get_session(open_id)
+        session_store.set_session(open_id, session_id)
+        try:
+            await _process_message_async(open_id, content, source_msg_id, chat_type, source_msg_id)
+        finally:
+            # 无论成功失败都还原（_process_message_async 内部会写入新 session_id，finally 覆盖回来）
+            if original_session_id:
+                session_store.set_session(open_id, original_session_id)
+            else:
+                session_store.clear_session(open_id)
+    except Exception as e:
+        logger.error("named session message 处理异常: open_id=%s name=%s error=%s", open_id, name, e, exc_info=True)
 
 
 async def _process_sessions_async(
@@ -811,6 +863,22 @@ def _on_message_receive(data: P2ImMessageReceiveV1) -> None:
         return
     if cmd in ("/compact", "/context"):
         _submit(_process_slash_async(open_id, cmd, chat_type, source_msg_id))
+        return
+    # /save <name> — 给当前 session 保存别名
+    if cmd.startswith("/save "):
+        name = cmd[6:].strip()
+        if name:
+            _submit(_process_save_session_async(open_id, name, chat_type, source_msg_id))
+        else:
+            _submit(_send_card(open_id, cards.build_text_card("⚠️ 用法：`/save <名称>`"), chat_type, source_msg_id))
+        return
+    # /s <name> <msg> — 在命名 session 内发消息，不切换当前 session
+    if cmd.startswith("/s "):
+        parts = cmd[3:].strip().split(" ", 1)
+        if len(parts) == 2 and parts[0] and parts[1]:
+            _submit(_process_named_session_message_async(open_id, parts[0], parts[1], chat_type, source_msg_id))
+        else:
+            _submit(_send_card(open_id, cards.build_text_card("⚠️ 用法：`/s <名称> <消息>`"), chat_type, source_msg_id))
         return
 
     # 普通消息路由

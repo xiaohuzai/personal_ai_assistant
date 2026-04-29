@@ -313,6 +313,8 @@ def _make_options(session_id: Optional[str], max_turns: int = 20) -> ClaudeAgent
         env={
             # 关闭 extended thinking（避免 thinking block invalid signature 错误）
             "MAX_THINKING_TOKENS": "0",
+            # 关闭实验性 beta 功能（避免 "Extra inputs are not permitted" 错误）
+            "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
         },
     )
 

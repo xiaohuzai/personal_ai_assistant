@@ -101,6 +101,8 @@ def build_help_card() -> dict:
         "| `/context` | 查看当前会话的上下文摘要 |\n"
         "| `/compact` | 压缩当前会话上下文（节省 token） |\n"
         "| `/sessions` | 查看历史会话并切换 |\n"
+        "| `/save <名称>` | 给当前会话保存别名 |\n"
+        "| `/s <名称> <消息>` | 在指定别名会话内发送消息（不切换当前会话） |\n"
         "| `/models` | 查看可用模型并切换 |\n\n"
         "💡 直接发送消息即可与 Agent 对话。"
     )
@@ -143,7 +145,8 @@ def build_sessions_card(
         preview = _truncate(s.get("preview", "（无内容）"), 80)
         time_str = _format_session_time(s.get("updated_at", 0))
         is_current = sid == current_session_id
-        label = f"{'✅ ' if is_current else ''}{sid[:8]} · {time_str} — {preview}"
+        name_tag = f"[{s['name']}] " if s.get("name") else ""
+        label = f"{'✅ ' if is_current else ''}{name_tag}{sid[:8]} · {time_str} — {preview}"
         options.append({"text": {"tag": "plain_text", "content": label}, "value": sid})
 
     elements: list[dict] = [
@@ -176,7 +179,8 @@ def build_session_switched_card(sessions: list[dict], switched_to_id: str) -> di
     if session:
         time_str = _format_session_time(session.get("updated_at", 0))
         preview = _truncate(session.get("preview", ""), 40)
-        detail = f"`{switched_to_id[:8]}` · {time_str}\n> {preview}"
+        name_tag = f"**[{session['name']}]** " if session.get("name") else ""
+        detail = f"{name_tag}`{switched_to_id[:8]}` · {time_str}\n> {preview}"
     else:
         detail = f"`{switched_to_id[:8]}`"
     return {
