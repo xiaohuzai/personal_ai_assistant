@@ -310,6 +310,10 @@ def _make_options(session_id: Optional[str], max_turns: int = 20) -> ClaudeAgent
         setting_sources=["project"],
         resume=session_id,
         max_turns=max_turns,
+        env={
+            # 关闭 extended thinking（避免 thinking block invalid signature 错误）
+            "MAX_THINKING_TOKENS": "0",
+        },
     )
 
 
@@ -517,12 +521,34 @@ def set_model(model_id: str) -> None:
     logger.info("ANTHROPIC_MODEL 已设置为 %s", model_id)
 
 
+def _apply_default_model() -> None:
+    """若 settings.json 中未设置 ANTHROPIC_MODEL，则写入默认值（ANTHROPIC_DEFAULT_SONNET_MODEL）。"""
+    default_model = os.environ.get("ANTHROPIC_DEFAULT_SONNET_MODEL", "")
+    if not default_model:
+        return
+    data: dict = {}
+    if os.path.exists(_PROJECT_SETTINGS_PATH):
+        try:
+            with open(_PROJECT_SETTINGS_PATH, encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            pass
+    if data.get("env", {}).get("ANTHROPIC_MODEL"):
+        return
+    os.makedirs(os.path.dirname(_PROJECT_SETTINGS_PATH), exist_ok=True)
+    data.setdefault("env", {})["ANTHROPIC_MODEL"] = default_model
+    with open(_PROJECT_SETTINGS_PATH, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+    logger.info("ANTHROPIC_MODEL 未设置，已写入默认值: %s", default_model)
+
+
 async def initialize() -> None:
     """模块初始化：加载持久化 env，注入 Node 工具路径，检查并自动配置 lark-cli。
     由 main.py 在启动时调用一次。
     """
     global _lark_cli_notice
     _load_agent_env()
+    _apply_default_model()
     _ensure_node_tools_in_path()
     _lark_cli_notice = await _setup_lark_cli()
     if _lark_cli_notice:

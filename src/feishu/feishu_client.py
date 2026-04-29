@@ -12,6 +12,7 @@ from lark_oapi.api.contact.v3 import GetUserRequest
 from lark_oapi.api.im.v1 import (
     CreateMessageRequest,
     CreateMessageRequestBody,
+    GetMessageRequest,
     GetMessageResourceRequest,
     PatchMessageRequest,
     PatchMessageRequestBody,
@@ -106,6 +107,91 @@ class FeishuClient:
             )
             return None
         return response.file.read()
+
+    def get_message(self, message_id: str) -> Optional[dict]:
+        """获取指定消息内容。返回 {msg_type, content, message_id}；失败返回 None。"""
+        request = GetMessageRequest.builder().message_id(message_id).build()
+        response = self._client.im.v1.message.get(request)
+        if not response.success():
+            logger.error(
+                "获取消息失败: message_id=%s, code=%s, msg=%s",
+                message_id, response.code, response.msg,
+            )
+            return None
+        items = getattr(response.data, "items", None)
+        if not items:
+            return None
+        msg = items[0]
+        body = getattr(msg, "body", None)
+        return {
+            "msg_type": getattr(msg, "msg_type", ""),
+            "content": getattr(body, "content", "{}") if body else "{}",
+            "message_id": getattr(msg, "message_id", message_id),
+        }
+
+    def resolve_quoted_content(self, message_id: str) -> dict:
+        """解析被引用消息的内容。返回 {text, image_keys, file_tuples, quoted_msg_id}。
+        不支持的类型（interactive 等）返回空结果，不影响主流程。
+        """
+        empty: dict = {"text": "", "image_keys": [], "file_tuples": [], "quoted_msg_id": message_id}
+        msg = self.get_message(message_id)
+        if not msg:
+            return empty
+        msg_type = msg["msg_type"]
+        quoted_msg_id = msg["message_id"]
+        try:
+            content = json.loads(msg["content"])
+        except (json.JSONDecodeError, TypeError):
+            return {**empty, "quoted_msg_id": quoted_msg_id}
+
+        if msg_type == "text":
+            return {"text": content.get("text", ""), "image_keys": [], "file_tuples": [], "quoted_msg_id": quoted_msg_id}
+        elif msg_type == "post":
+            text, image_keys = self._parse_post_content(content)
+            return {"text": text, "image_keys": image_keys, "file_tuples": [], "quoted_msg_id": quoted_msg_id}
+        elif msg_type == "image":
+            key = content.get("image_key", "")
+            return {"text": "", "image_keys": [key] if key else [], "file_tuples": [], "quoted_msg_id": quoted_msg_id}
+        elif msg_type == "file":
+            file_key = content.get("file_key", "")
+            file_name = content.get("file_name", "unnamed_file")
+            return {"text": "", "image_keys": [], "file_tuples": [(file_key, file_name)] if file_key else [], "quoted_msg_id": quoted_msg_id}
+        else:
+            return {**empty, "quoted_msg_id": quoted_msg_id}
+
+    @staticmethod
+    def _parse_post_content(content: dict) -> tuple[str, list[str]]:
+        """从 post 类型消息中提取纯文本和图片 key 列表。"""
+        lang_content = (
+            content.get("zh_cn") or content.get("en_us")
+            or (content if "content" in content else {})
+        )
+        parts: list[str] = []
+        image_keys: list[str] = []
+        if not lang_content:
+            return "", []
+        title = lang_content.get("title", "")
+        if title:
+            parts.append(title)
+        for paragraph in lang_content.get("content", []):
+            line_parts: list[str] = []
+            for elem in paragraph:
+                tag = elem.get("tag", "")
+                if tag == "text":
+                    line_parts.append(elem.get("text", ""))
+                elif tag == "at":
+                    name = elem.get("user_name", "")
+                    line_parts.append(f"@{name}" if name else "")
+                elif tag == "a":
+                    link_text = elem.get("text", "")
+                    href = elem.get("href", "")
+                    line_parts.append(f"{link_text}({href})" if href else link_text)
+                elif tag == "img":
+                    key = elem.get("image_key", "")
+                    if key:
+                        image_keys.append(key)
+            parts.append("".join(line_parts))
+        return "\n".join(parts).strip(), image_keys
 
     # ------------------------------------------------------------------ 消息
 

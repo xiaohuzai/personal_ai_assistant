@@ -274,38 +274,9 @@ def _resolve_mentions(text: str, raw_mentions: list) -> str:
 
 
 def _extract_post_content(content: dict) -> tuple[str, list[str]]:
-    """从富文本(post)消息中提取纯文本和图片 key 列表。"""
-    lang_content = (
-        content.get("zh_cn")
-        or content.get("en_us")
-        or (content if "content" in content else {})
-    )
-    if not lang_content:
-        return "", []
-    parts = []
-    image_keys: list[str] = []
-    title = lang_content.get("title", "")
-    if title:
-        parts.append(title)
-    for paragraph in lang_content.get("content", []):
-        line_parts = []
-        for elem in paragraph:
-            tag = elem.get("tag", "")
-            if tag == "text":
-                line_parts.append(elem.get("text", ""))
-            elif tag == "at":
-                name = elem.get("user_name", "")
-                line_parts.append(f"@{name}" if name else "")
-            elif tag == "a":
-                link_text = elem.get("text", "")
-                href = elem.get("href", "")
-                line_parts.append(f"{link_text}({href})" if href else link_text)
-            elif tag == "img":
-                key = elem.get("image_key", "")
-                if key:
-                    image_keys.append(key)
-        parts.append("".join(line_parts))
-    return "\n".join(parts).strip(), image_keys
+    """从富文本(post)消息中提取纯文本和图片 key 列表。委托给 FeishuClient._parse_post_content。"""
+    from .feishu_client import FeishuClient
+    return FeishuClient._parse_post_content(content)
 
 
 # ─────────────────── 发送卡片（私聊/群聊）────────────────────────
@@ -333,6 +304,7 @@ async def _process_message_async(
     image_keys: Optional[list[str]] = None,
     file_tuples: Optional[list[tuple[str, str]]] = None,  # [(file_key, file_name), ...]
     meta: Optional[dict] = None,
+    quoted_msg_id: Optional[str] = None,
 ) -> None:
     """异步协程：（下载图片/文件）→ 发占位卡片 → 调用 Agent → 打字机更新卡片。"""
     # 生成 stop_token，注册运行中任务，支持 ⏹ 停止按钮
@@ -343,8 +315,25 @@ async def _process_message_async(
         _running_tasks[stop_token] = task
 
     try:
-        # 0a. 下载图片
+        # 处理引用消息（用户回复某条消息时，将被引用内容前置注入）
         images: list[dict] = []
+        files: list[dict] = []
+        if quoted_msg_id and _feishu:
+            resolved = await asyncio.to_thread(_feishu.resolve_quoted_content, quoted_msg_id)
+            if resolved["text"]:
+                text = f"> [引用]: {resolved['text']}\n\n{text}" if text else f"> [引用]: {resolved['text']}"
+            for key in resolved["image_keys"]:
+                result = await asyncio.to_thread(_feishu.download_image_b64, resolved["quoted_msg_id"], key)
+                if result:
+                    images.append(result)
+            for file_key, file_name in resolved["file_tuples"]:
+                file_bytes = await asyncio.to_thread(_feishu.download_file, resolved["quoted_msg_id"], file_key)
+                if file_bytes:
+                    files.append({"file_name": file_name, "data": file_bytes})
+                else:
+                    logger.warning("引用消息文件下载失败，跳过: file_key=%s", file_key)
+
+        # 0a. 下载图片
         if image_keys and _feishu:
             for key in image_keys:
                 result = await asyncio.to_thread(_feishu.download_image_b64, feishu_msg_id, key)
@@ -352,7 +341,6 @@ async def _process_message_async(
                     images.append(result)
 
         # 0b. 下载文件（原始字节，由 assistant 负责保存到 workspace）
-        files: list[dict] = []
         if file_tuples and _feishu:
             for file_key, file_name in file_tuples:
                 file_bytes = await asyncio.to_thread(_feishu.download_file, feishu_msg_id, file_key)
@@ -781,7 +769,7 @@ def _on_message_receive(data: P2ImMessageReceiveV1) -> None:
 
     text = text.lstrip()
 
-    if not text and not image_keys and not file_tuples:
+    if not text and not image_keys and not file_tuples and not message.parent_id:
         return
 
     sender = data.event.sender
@@ -829,6 +817,7 @@ def _on_message_receive(data: P2ImMessageReceiveV1) -> None:
     _submit(_process_message_async(
         open_id, text, source_msg_id, chat_type, source_msg_id,
         image_keys or None, file_tuples or None, meta,
+        quoted_msg_id=message.parent_id or None,
     ))
 
 
