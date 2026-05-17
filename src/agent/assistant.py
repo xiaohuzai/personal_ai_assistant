@@ -476,23 +476,36 @@ _PROJECT_SETTINGS_PATH = os.path.join(WORKSPACE, ".claude", "settings.json")
 
 # 可选模型列表（用于 /models 卡片）
 # 优先读 .env 里的网关别名，保证发给网关的 model ID 与网关配置一致；
-# 未配置时回退到 Anthropic 官方 ID。
+# AVAILABLE_MODELS 在 initialize() 时由 _build_available_models() 填充（load_dotenv 之后）。
+# 优先读 ANTHROPIC_AVAILABLE_MODELS（逗号分隔的 model id 列表），
+# 未配置时回退到三个 ANTHROPIC_DEFAULT_*_MODEL 变量。
+AVAILABLE_MODELS: list[dict] = []
+
+
 def _build_available_models() -> list[dict]:
+    raw = os.environ.get("ANTHROPIC_AVAILABLE_MODELS", "").strip()
+    if raw:
+        seen: set[str] = set()
+        result: list[dict] = []
+        for model_id in (m.strip() for m in raw.split(",") if m.strip()):
+            if model_id not in seen:
+                result.append({"id": model_id, "name": model_id})
+                seen.add(model_id)
+        if result:
+            return result
+    # 回退：Anthropic 官方默认三个模型
     entries = [
-        (os.environ.get("ANTHROPIC_DEFAULT_SONNET_MODEL", "claude-sonnet-4-6"), "Claude Sonnet（默认）"),
-        (os.environ.get("ANTHROPIC_DEFAULT_OPUS_MODEL",   "claude-opus-4-6"),   "Claude Opus（最强）"),
-        (os.environ.get("ANTHROPIC_DEFAULT_HAIKU_MODEL",  "claude-haiku-4-5-20251001"), "Claude Haiku（最快）"),
+        ("claude-sonnet-4-6", "Claude Sonnet（默认）"),
+        ("claude-opus-4-6",   "Claude Opus（最强）"),
+        ("claude-haiku-4-5-20251001", "Claude Haiku（最快）"),
     ]
-    seen: set[str] = set()
-    result: list[dict] = []
+    seen = set()
+    result = []
     for model_id, name in entries:
         if model_id and model_id not in seen:
             result.append({"id": model_id, "name": f"{name} · {model_id}"})
             seen.add(model_id)
     return result
-
-
-AVAILABLE_MODELS: list[dict] = _build_available_models()
 
 
 def get_current_model() -> str:
@@ -524,8 +537,11 @@ def set_model(model_id: str) -> None:
 
 
 def _apply_default_model() -> None:
-    """若 settings.json 中未设置 ANTHROPIC_MODEL，则写入默认值（ANTHROPIC_DEFAULT_SONNET_MODEL）。"""
-    default_model = os.environ.get("ANTHROPIC_DEFAULT_SONNET_MODEL", "")
+    """若 settings.json 中未设置 ANTHROPIC_MODEL，则写入默认值。
+    优先取 AVAILABLE_MODELS 第一个，回退到 ANTHROPIC_DEFAULT_SONNET_MODEL。
+    """
+    default_model = (AVAILABLE_MODELS[0]["id"] if AVAILABLE_MODELS else "") \
+        or os.environ.get("ANTHROPIC_DEFAULT_SONNET_MODEL", "")
     if not default_model:
         return
     data: dict = {}
@@ -548,8 +564,10 @@ async def initialize() -> None:
     """模块初始化：加载持久化 env，注入 Node 工具路径，检查并自动配置 lark-cli。
     由 main.py 在启动时调用一次。
     """
-    global _lark_cli_notice
+    global _lark_cli_notice, AVAILABLE_MODELS
     _load_agent_env()
+    AVAILABLE_MODELS = _build_available_models()
+    logger.info("可用模型列表（%d 个）: %s", len(AVAILABLE_MODELS), [m["id"] for m in AVAILABLE_MODELS])
     _apply_default_model()
     _ensure_node_tools_in_path()
     _lark_cli_notice = await _setup_lark_cli()
