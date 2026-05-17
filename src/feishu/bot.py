@@ -313,6 +313,9 @@ async def _process_message_async(
     if task:
         _running_tasks[stop_token] = task
 
+    # done_event：agent 调用结束后置位，阻止仍在途的进度卡片更新覆盖最终卡片
+    done_event = threading.Event()
+
     try:
         # 处理引用消息（用户回复某条消息时，将被引用内容前置注入）
         images: list[dict] = []
@@ -364,7 +367,12 @@ async def _process_message_async(
                 last_tool_update = now
                 progress = cards.build_thinking_card(f"⚙️ 正在执行 {tool_name}...", stop_token)
                 # fire-and-forget：不阻塞主任务，task.cancel() 可立即注入 CancelledError
-                asyncio.ensure_future(asyncio.to_thread(_feishu.update_card, message_id, progress))
+                # done_event 置位后跳过更新，避免覆盖最终卡片
+                def _do_tool_update(_card=progress, _mid=message_id) -> None:
+                    if done_event.is_set():
+                        return
+                    _feishu.update_card(_mid, _card)
+                asyncio.ensure_future(asyncio.to_thread(_do_tool_update))
 
         choice_request = None
         interrupted = False
@@ -389,8 +397,9 @@ async def _process_message_async(
             logger.error("Agent 调用失败: open_id=%s, error=%s", open_id, e)
             reply = f"❌ 服务暂时不可用，请稍后重试。\n\n`{e}`"
 
-        # Agent 调用已结束（成功/失败/中断），提前清理 stop_token。
-        # 此后点击停止按钮将因 token 不存在而静默忽略，避免打字机更新被意外取消。
+        # Agent 调用已结束，置位 done_event 阻止仍在途的进度更新线程写入卡片。
+        done_event.set()
+        # 提前清理 stop_token：此后点击停止按钮将因 token 不存在而静默忽略。
         _running_tasks.pop(stop_token, None)
         _pop_pending_stop(stop_token)
 
@@ -430,6 +439,15 @@ async def _process_message_async(
                 ))
         elif message_id:
             await _typewriter_update(message_id, reply)
+            # 进度更新线程可能在最终写入后仍短暂覆盖卡片，500ms 后重刷确保最终状态正确
+            final_card = cards.build_text_card(reply)
+            async def _reguard(_mid=message_id, _card=final_card) -> None:
+                await asyncio.sleep(0.5)
+                try:
+                    await asyncio.to_thread(_feishu.update_card, _mid, _card)
+                except Exception:
+                    pass
+            asyncio.ensure_future(_reguard())
         else:
             await _send_card(open_id, cards.build_text_card(reply), chat_type, source_msg_id)
 

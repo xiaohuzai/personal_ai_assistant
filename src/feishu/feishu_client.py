@@ -111,6 +111,9 @@ class FeishuClient:
     def get_message(self, message_id: str) -> Optional[dict]:
         """获取指定消息内容。返回 {msg_type, content, message_id}；失败返回 None。"""
         request = GetMessageRequest.builder().message_id(message_id).build()
+        # card_msg_content_type=user_card_content：获取 schema 2.0 卡片的原始 JSON
+        # 不加此参数时，飞书对 schema 2.0 卡片返回降级的图片格式，内容为空
+        request.add_query("card_msg_content_type", "user_card_content")
         response = self._client.im.v1.message.get(request)
         if not response.success():
             logger.error(
@@ -130,15 +133,14 @@ class FeishuClient:
         }
 
     def resolve_quoted_content(self, message_id: str) -> dict:
-        """解析被引用消息的内容。返回 {text, image_keys, file_tuples, quoted_msg_id}。
-        不支持的类型（interactive 等）返回空结果，不影响主流程。
-        """
+        """解析被引用消息的内容。返回 {text, image_keys, file_tuples, quoted_msg_id}。"""
         empty: dict = {"text": "", "image_keys": [], "file_tuples": [], "quoted_msg_id": message_id}
         msg = self.get_message(message_id)
         if not msg:
             return empty
         msg_type = msg["msg_type"]
         quoted_msg_id = msg["message_id"]
+        logger.info("resolve_quoted_content: message_id=%s msg_type=%s", message_id, msg_type)
         try:
             content = json.loads(msg["content"])
         except (json.JSONDecodeError, TypeError):
@@ -156,8 +158,84 @@ class FeishuClient:
             file_key = content.get("file_key", "")
             file_name = content.get("file_name", "unnamed_file")
             return {"text": "", "image_keys": [], "file_tuples": [(file_key, file_name)] if file_key else [], "quoted_msg_id": quoted_msg_id}
+        elif msg_type == "interactive":
+            text = self._parse_interactive_card_content(content)
+            image_keys = self._extract_interactive_fallback_images(content)
+            return {"text": text, "image_keys": image_keys, "file_tuples": [], "quoted_msg_id": quoted_msg_id}
         else:
             return {**empty, "quoted_msg_id": quoted_msg_id}
+
+    @staticmethod
+    def _parse_interactive_card_content(content: dict) -> str:
+        """从 interactive 消息卡片中提取可读文本。支持 schema 2.0 和旧版卡片格式。"""
+        if "card" in content and isinstance(content["card"], dict):
+            content = content["card"]
+
+        parts: list[str] = []
+
+        header = content.get("header", {})
+        title_obj = header.get("title", {}) if isinstance(header, dict) else {}
+        if isinstance(title_obj, dict):
+            if t := title_obj.get("content", "").strip():
+                parts.append(f"[卡片标题: {t}]")
+
+        # schema 2.0: body.elements
+        body = content.get("body", {})
+        if isinstance(body, dict):
+            FeishuClient._extract_elements_text(body.get("elements", []), parts)
+
+        # 旧格式: 顶层 elements
+        if top := content.get("elements", []):
+            FeishuClient._extract_elements_text(top, parts)
+
+        return "\n".join(parts).strip()
+
+    @staticmethod
+    def _extract_elements_text(elements: list, parts: list[str]) -> None:
+        """递归提取 elements 中的文本内容。折叠面板只取标题，跳过内部细节。"""
+        for elem in elements:
+            if not isinstance(elem, dict):
+                continue
+            tag = elem.get("tag", "")
+            if tag == "markdown":
+                if c := elem.get("content", "").strip():
+                    parts.append(c)
+            elif tag in ("plain_text", "lark_md"):
+                if c := elem.get("content", "").strip():
+                    parts.append(c)
+            elif tag == "div":
+                text_obj = elem.get("text", {})
+                if isinstance(text_obj, dict):
+                    if c := text_obj.get("content", "").strip():
+                        parts.append(c)
+                for field in elem.get("fields", []):
+                    t = field.get("text", {}) if isinstance(field, dict) else {}
+                    if isinstance(t, dict):
+                        if c := t.get("content", "").strip():
+                            parts.append(c)
+            elif tag == "collapsible_panel":
+                ph = elem.get("header", {})
+                pt = ph.get("title", {}) if isinstance(ph, dict) else {}
+                if isinstance(pt, dict):
+                    if c := pt.get("content", "").strip():
+                        parts.append(f"[折叠: {c}]")
+
+    @staticmethod
+    def _extract_interactive_fallback_images(content: dict) -> list[str]:
+        """提取飞书对 schema 2.0 卡片的降级格式中的图片 key（兜底方案）。
+        降级格式：{"title": null, "elements": [[{"tag": "img", "image_key": "..."}]]}
+        """
+        actual = content.get("card", content) if "card" in content else content
+        if "body" in actual or "schema" in actual:
+            return []
+        image_keys: list[str] = []
+        for paragraph in actual.get("elements", []):
+            if isinstance(paragraph, list):
+                for elem in paragraph:
+                    if isinstance(elem, dict) and elem.get("tag") == "img":
+                        if key := elem.get("image_key", ""):
+                            image_keys.append(key)
+        return image_keys
 
     @staticmethod
     def _parse_post_content(content: dict) -> tuple[str, list[str]]:
