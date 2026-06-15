@@ -117,10 +117,12 @@ def _extract_session_preview(fpath: str) -> str:
 
 def list_sessions(cwd: str) -> list[dict]:
     """
-    扫描 JSONL 文件，返回所有历史 session 列表，按最后修改时间倒序。
-    每项格式：{"session_id": str, "updated_at": int, "preview": str}
+    扫描 JSONL 文件，返回所有历史 session 列表。
+    命名 session 优先排在前面，其余按最后修改时间倒序。
+    每项格式：{"session_id": str, "updated_at": int, "preview": str, "name": str | None}
     """
     sessions_dir = _sessions_dir(cwd)
+    name_map = session_id_to_name_map()
     results: list[dict] = []
     if not os.path.isdir(sessions_dir):
         return results
@@ -134,6 +136,45 @@ def list_sessions(cwd: str) -> list[dict]:
         except OSError:
             mtime = 0
         preview = _extract_session_preview(fpath)
-        results.append({"session_id": session_id, "updated_at": mtime, "preview": preview})
-    results.sort(key=lambda x: x["updated_at"], reverse=True)
+        results.append({"session_id": session_id, "updated_at": mtime, "preview": preview, "name": name_map.get(session_id)})
+    results.sort(key=lambda x: (0 if x["name"] else 1, -x["updated_at"]))
     return results
+
+
+# ─────────────────── Session 命名（别名） ────────────────────────
+
+def _session_names_path() -> str:
+    workspace = os.environ.get("ASSISTANT_CWD", os.path.join(os.getcwd(), "workspace"))
+    return os.path.join(workspace, "session_names.json")
+
+
+def _read_session_names() -> dict[str, str]:
+    """读取 {name: session_id} 映射；文件不存在或损坏时返回空 dict。"""
+    path = _session_names_path()
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def save_session_name(name: str, session_id: str) -> Optional[str]:
+    """将 name→session_id 写入映射文件。返回被覆盖的旧 session_id；无覆盖则返回 None。"""
+    path = _session_names_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    names = _read_session_names()
+    old = names.get(name)
+    names[name] = session_id
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(names, f, ensure_ascii=False)
+    return old if old and old != session_id else None
+
+
+def get_session_by_name(name: str) -> Optional[str]:
+    """按别名查 session_id；不存在返回 None。"""
+    return _read_session_names().get(name)
+
+
+def session_id_to_name_map() -> dict[str, str]:
+    """返回 {session_id: name} 反向映射。"""
+    return {sid: n for n, sid in _read_session_names().items()}
