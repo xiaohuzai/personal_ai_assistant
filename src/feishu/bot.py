@@ -1107,6 +1107,54 @@ async def _handle_switch_model_action_async(
     return resp
 
 
+# ──────────────────────── 机器人菜单 ─────────────────────────────
+# 飞书开放平台 → 应用 → 机器人 → 机器人菜单 中配置各项，event_key 与下表对应：
+#
+#  event_key       菜单文字（建议）    触发行为
+#  ─────────────────────────────────────────────────────
+#  help            帮助 / 指令手册    显示 /help 卡片
+#  new_session     新建对话           清空历史 /new
+#  sessions        历史会话           /sessions 切换卡片
+#  models          切换模型           /models 切换卡片
+#  toggle_rich     富文本模式         /rich 开关
+#
+# 在后台添加菜单项后，用户点击即触发 p2.application.bot.menu_v6 事件。
+
+def _on_bot_menu(data) -> None:
+    """飞书机器人菜单点击回调。"""
+    try:
+        event = getattr(data, "event", None)
+        if not event:
+            return
+        event_key: str = getattr(event, "event_key", "") or ""
+        operator = getattr(event, "operator", None)
+        open_id: Optional[str] = getattr(operator, "operator_id", None)
+        if not open_id:
+            # 兼容不同版本 SDK 字段名
+            open_id = getattr(operator, "open_id", None)
+        if not open_id:
+            logger.warning("bot_menu: 无法获取 open_id, event_key=%s", event_key)
+            return
+
+        logger.info("bot_menu: open_id=%s event_key=%s", open_id, event_key)
+
+        # 菜单项 → 对应的处理协程（私聊模式，chat_type=p2p，source_msg_id=None）
+        if event_key == "help":
+            _submit(_send_card(open_id, cards.build_help_card(), "p2p", None))
+        elif event_key == "new_session":
+            _submit(_process_reset_async(open_id, "p2p", None))
+        elif event_key == "sessions":
+            _submit(_process_sessions_async(open_id, "p2p", None))
+        elif event_key == "models":
+            _submit(_process_models_async(open_id, "p2p", None))
+        elif event_key == "toggle_rich":
+            _submit(_process_rich_mode_async(open_id, "p2p", None))
+        else:
+            logger.info("bot_menu: 未知 event_key=%s，忽略", event_key)
+    except Exception as e:
+        logger.error("bot_menu 处理异常: %s", e, exc_info=True)
+
+
 def _on_message_receive(data: P2ImMessageReceiveV1) -> None:
     """飞书 im.message.receive_v1 事件回调（必须在 3s 内返回）。"""
     message = data.event.message
@@ -1272,6 +1320,7 @@ def start(app_id: str, app_secret: str) -> None:
         .register_p2_im_message_message_read_v1(lambda _: None)
         .register_p2_im_message_reaction_created_v1(lambda _: None)
         .register_p2_im_message_reaction_deleted_v1(lambda _: None)
+        .register_p2_application_bot_menu_v6(_on_bot_menu)
         .register_p2_card_action_trigger(_on_card_action)
         .build()
     )
