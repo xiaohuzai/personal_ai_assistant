@@ -1128,10 +1128,9 @@ def _on_bot_menu(data) -> None:
             return
         event_key: str = getattr(event, "event_key", "") or ""
         operator = getattr(event, "operator", None)
-        open_id: Optional[str] = getattr(operator, "operator_id", None)
-        if not open_id:
-            # 兼容不同版本 SDK 字段名
-            open_id = getattr(operator, "open_id", None)
+        # operator.operator_id 是 UserId 对象，需要取其 .open_id 字段
+        operator_id_obj = getattr(operator, "operator_id", None)
+        open_id: Optional[str] = getattr(operator_id_obj, "open_id", None)
         if not open_id:
             logger.warning("bot_menu: 无法获取 open_id, event_key=%s", event_key)
             return
