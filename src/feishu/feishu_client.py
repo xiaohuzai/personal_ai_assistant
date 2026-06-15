@@ -10,8 +10,13 @@ from typing import Optional
 import lark_oapi as lark
 from lark_oapi.api.contact.v3 import GetUserRequest
 from lark_oapi.api.im.v1 import (
+    CreateFileRequest,
+    CreateFileRequestBody,
+    CreateMessageReactionRequest,
+    CreateMessageReactionRequestBody,
     CreateMessageRequest,
     CreateMessageRequestBody,
+    DeleteMessageRequest,
     GetMessageRequest,
     GetMessageResourceRequest,
     PatchMessageRequest,
@@ -19,6 +24,7 @@ from lark_oapi.api.im.v1 import (
     ReplyMessageRequest,
     ReplyMessageRequestBody,
 )
+from lark_oapi.api.im.v1.model import Emoji
 
 logger = logging.getLogger(__name__)
 
@@ -321,17 +327,19 @@ class FeishuClient:
         )
         return None
 
-    def reply_card_to_message(self, origin_message_id: str, card: dict) -> Optional[str]:
+    def reply_card_to_message(self, origin_message_id: str, card: dict, in_thread: bool = False) -> Optional[str]:
         """回复指定消息（群聊场景），返回回复消息的 message_id；失败返回 None。"""
+        body_builder = (
+            ReplyMessageRequestBody.builder()
+            .msg_type("interactive")
+            .content(json.dumps(card, ensure_ascii=False))
+        )
+        if in_thread:
+            body_builder = body_builder.reply_in_thread(True)
         request = (
             ReplyMessageRequest.builder()
             .message_id(origin_message_id)
-            .request_body(
-                ReplyMessageRequestBody.builder()
-                .msg_type("interactive")
-                .content(json.dumps(card, ensure_ascii=False))
-                .build()
-            )
+            .request_body(body_builder.build())
             .build()
         )
         response = self._client.im.v1.message.reply(request)
@@ -344,6 +352,98 @@ class FeishuClient:
             origin_message_id, response.code, response.msg,
         )
         return None
+
+    def add_reaction(self, message_id: str, emoji_type: str = "OneSecond") -> bool:
+        """给指定消息添加表情回复。"""
+        request = (
+            CreateMessageReactionRequest.builder()
+            .message_id(message_id)
+            .request_body(
+                CreateMessageReactionRequestBody.builder()
+                .reaction_type(Emoji.builder().emoji_type(emoji_type).build())
+                .build()
+            )
+            .build()
+        )
+        response = self._client.im.v1.message_reaction.create(request)
+        if response.success():
+            return True
+        logger.warning("添加表情回复失败: message_id=%s, code=%s, msg=%s",
+                       message_id, response.code, response.msg)
+        return False
+
+    def upload_text_as_file(self, content: str, file_name: str) -> Optional[str]:
+        """将文本内容上传为飞书文件，返回 file_key；失败返回 None。"""
+        import io
+        raw = content.encode("utf-8")
+        request = (
+            CreateFileRequest.builder()
+            .request_body(
+                CreateFileRequestBody.builder()
+                .file_type("stream")
+                .file_name(file_name)
+                .file(io.BytesIO(raw))
+                .build()
+            )
+            .build()
+        )
+        response = self._client.im.v1.file.create(request)
+        if response.success():
+            return response.data.file_key
+        logger.error("文件上传失败: code=%s, msg=%s", response.code, response.msg)
+        return None
+
+    def send_file_to_open_id(self, open_id: str, file_key: str) -> bool:
+        """向 open_id 发送文件消息。"""
+        request = (
+            CreateMessageRequest.builder()
+            .receive_id_type("open_id")
+            .request_body(
+                CreateMessageRequestBody.builder()
+                .receive_id(open_id)
+                .msg_type("file")
+                .content(json.dumps({"file_key": file_key}, ensure_ascii=False))
+                .build()
+            )
+            .build()
+        )
+        response = self._client.im.v1.message.create(request)
+        if response.success():
+            return True
+        logger.error("文件消息发送失败: open_id=%s, code=%s, msg=%s", open_id, response.code, response.msg)
+        return False
+
+    def reply_file_to_message(self, message_id: str, file_key: str, in_thread: bool = False) -> bool:
+        """回复文件消息到指定消息。"""
+        body_builder = (
+            ReplyMessageRequestBody.builder()
+            .msg_type("file")
+            .content(json.dumps({"file_key": file_key}, ensure_ascii=False))
+        )
+        if in_thread:
+            body_builder = body_builder.reply_in_thread(True)
+        request = (
+            ReplyMessageRequest.builder()
+            .message_id(message_id)
+            .request_body(body_builder.build())
+            .build()
+        )
+        response = self._client.im.v1.message.reply(request)
+        if response.success():
+            return True
+        logger.error("文件回复失败: message_id=%s, code=%s, msg=%s", message_id, response.code, response.msg)
+        return False
+
+    def recall_message(self, message_id: str) -> bool:
+        """撤回指定消息（Bot 只能撤回自己发的消息，发送后 24 小时内有效）。"""
+        request = DeleteMessageRequest.builder().message_id(message_id).build()
+        response = self._client.im.v1.message.delete(request)
+        if response.success():
+            logger.info("消息撤回成功: message_id=%s", message_id)
+            return True
+        logger.error("消息撤回失败: message_id=%s, code=%s, msg=%s",
+                     message_id, response.code, response.msg)
+        return False
 
     def update_card(self, message_id: str, card: dict) -> bool:
         """更新已发送的消息卡片内容。"""
