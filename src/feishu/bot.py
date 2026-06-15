@@ -7,12 +7,20 @@
 支持场景: 私聊（p2p）、群聊（group，@Bot 触发）
 
 斜杠指令:
-  /help     — 显示帮助
-  /new      — 新建会话（清空历史上下文）
-  /reset    — 同 /new（兼容旧指令）
-  /context  — 查看当前会话上下文摘要
-  /compact  — 压缩当前会话上下文
-  /sessions — 查看历史会话并切换
+  /help               — 显示帮助
+  /new                — 新建会话（清空历史上下文）
+  /reset              — 同 /new（兼容旧指令）
+  /context            — 查看当前会话上下文摘要
+  /compact            — 压缩当前会话上下文
+  /sessions           — 查看历史会话并切换
+  /models             — 查看可用模型并切换
+  /save <名称>         — 给当前会话保存别名
+  /s <名称> <消息>     — 在指定别名会话内发消息
+  /rich               — 切换富文本展示模式
+  /thread [on|off]    — 切换群聊话题回复模式
+  /turns [N]          — 查看或设置 max_turns
+  /effort [level]     — 查看或设置 effort
+  /shell <命令>        — 直接执行 shell 命令
 
 配置（环境变量）:
   FEISHU_APP_ID        飞书应用 App ID
@@ -21,14 +29,23 @@
   AGENT_OWNER          用户标识（默认 user）
 """
 import asyncio
+import datetime
 import json
 import logging
 import os
+import random
+import re
 import threading
 import time
 import uuid
 from dataclasses import dataclass
 from typing import Optional
+
+_TZ_BJ = datetime.timezone(datetime.timedelta(hours=8))
+
+
+def _bj() -> str:
+    return datetime.datetime.now(_TZ_BJ).strftime("%H:%M:%S.%f")[:-3]
 
 import lark_oapi as lark
 from cachetools import TTLCache
@@ -41,7 +58,7 @@ from lark_oapi.event.callback.model.p2_card_action_trigger import (
 
 from .feishu_client import FeishuClient
 from . import card as cards
-from ..agent import assistant, session as session_store
+from ..agent import assistant, session as session_store, prefs as user_prefs
 from ..agent.assistant import AVAILABLE_MODELS, get_current_model, set_model
 
 logger = logging.getLogger(__name__)
@@ -205,6 +222,34 @@ def _get_user_info_cached(open_id: str) -> Optional[dict]:
     return user_info
 
 
+# ──────────────────────── 表格限制处理 ───────────────────────────
+
+_TABLE_RE = re.compile(
+    r'\|[^\n]+\|\n\|[-|: ]+\|\n(?:\|[^\n]+\|\n?)*',
+    re.MULTILINE,
+)
+_MAX_FEISHU_TABLES = 5
+
+
+def _limit_tables(reply: str) -> str:
+    """飞书卡片最多渲染 5 个 Markdown 表格（超出报错）。超出部分替换为提示。"""
+    matches = list(_TABLE_RE.finditer(reply))
+    if len(matches) <= _MAX_FEISHU_TABLES:
+        return reply
+    hidden = len(matches) - _MAX_FEISHU_TABLES
+    hint = (
+        f"\n---\n"
+        f"💡 还有 **{hidden}** 个表格未显示（飞书卡片最多展示 {_MAX_FEISHU_TABLES} 个）。"
+        f"如需完整内容，告诉 Agent：**把完整结果输出到文档**\n\n---"
+    )
+    result = reply
+    for i in range(len(matches) - 1, _MAX_FEISHU_TABLES - 1, -1):
+        replacement = hint if i == _MAX_FEISHU_TABLES else ''
+        m = matches[i]
+        result = result[:m.start()] + replacement + result[m.end():]
+    return result
+
+
 # ──────────────────────── 打字机效果 ─────────────────────────────
 
 def _split_into_chunks(lines: list[str]) -> list[list[str]]:
@@ -286,9 +331,10 @@ async def _send_card(
     chat_type: str,
     source_msg_id: Optional[str],
 ) -> Optional[str]:
-    """根据聊天类型选择发送方式：群聊 reply，私聊 send。"""
+    """根据聊天类型选择发送方式：群聊 reply（支持 thread），私聊 send。"""
     if chat_type == "group" and source_msg_id:
-        return await asyncio.to_thread(_feishu.reply_card_to_message, source_msg_id, card)
+        in_thread = user_prefs.get_reply_in_thread(open_id)
+        return await asyncio.to_thread(_feishu.reply_card_to_message, source_msg_id, card, in_thread)
     return await asyncio.to_thread(_feishu.send_card_to_open_id, open_id, card)
 
 
@@ -312,6 +358,14 @@ async def _process_message_async(
     task = asyncio.current_task()
     if task:
         _running_tasks[stop_token] = task
+
+    # done_event：agent 调用结束后置位，阻止仍在途的进度卡片更新覆盖最终卡片
+    done_event = threading.Event()
+
+    # 读取用户偏好
+    rich_mode = user_prefs.get_rich_mode(open_id)
+    max_turns = user_prefs.get_max_turns(open_id)
+    effort = user_prefs.get_effort(open_id)
 
     try:
         # 处理引用消息（用户回复某条消息时，将被引用内容前置注入）
@@ -348,23 +402,99 @@ async def _process_message_async(
                 else:
                     logger.warning("飞书文件下载失败，跳过: file_key=%s", file_key)
 
-        # 1. 发"思考中"占位卡片（含 ⏹ 停止按钮）
+        # 1. 发"思考中"占位卡片（含 ⏹ 停止按钮），同时给原消息加 ⏳ 表情
         thinking_card = cards.build_thinking_card("⏳ 正在思考...", stop_token)
         message_id = await _send_card(open_id, thinking_card, chat_type, source_msg_id)
+        if _feishu:
+            asyncio.ensure_future(asyncio.to_thread(_feishu.add_reaction, feishu_msg_id, "OneSecond"))
+        logger.info("TIMING card_sent open_id=%s stop_token=%s t=%s", open_id, stop_token, _bj())
 
         # 2. 调用 Agent，实时更新占位卡片（工具调用进度，含 ⏹ 停止按钮）
-        last_tool_update = 0.0
+        last_card_update = 0.0
+        collected_events: list[dict] = []
+        _text_parts: list[str] = []          # 累积 text_delta，用于进度卡片实时文字显示
+        _pending_card_tasks: list[asyncio.Task] = []  # 用于完成时批量 cancel
 
-        async def on_tool_use(tool_name: str) -> None:
-            nonlocal last_tool_update
+        async def on_event(ev: dict) -> None:
+            """实时事件回调：累积事件 + 更新进度卡片。"""
+            nonlocal last_card_update
+            ev_type = ev.get("type", "")
+
+            # text_delta：累积文字，用于进度卡片实时展示（不加入折叠面板列表）
+            if ev_type == "text_delta":
+                _text_parts.append(ev.get("text", ""))
+                if not (rich_mode and message_id and stop_token):
+                    return
+                now = time.monotonic()
+                if now - last_card_update < 2.0:
+                    return  # 文字流节流：每 2s 刷一次进度卡片
+                last_card_update = now
+                current_text = "".join(_text_parts) + "\n▌"
+                card = cards.build_progress_card(
+                    collected_events, "⏳ 正在输出...", stop_token,
+                    current_text=current_text,
+                )
+
+                def _do_text_update(_c=card, _mid=message_id) -> None:
+                    if done_event.is_set():
+                        return
+                    _feishu.update_card(_mid, _c)
+                task = asyncio.ensure_future(asyncio.to_thread(_do_text_update))
+                _pending_card_tasks.append(task)
+                return
+
+            # 其他事件：追加到本地列表
+            collected_events.append(ev)
             if not message_id:
                 return
             now = time.monotonic()
-            if now - last_tool_update > 2.0:
-                last_tool_update = now
-                progress = cards.build_thinking_card(f"⚙️ 正在执行 {tool_name}...", stop_token)
-                # fire-and-forget：不阻塞主任务，task.cancel() 可立即注入 CancelledError
-                asyncio.ensure_future(asyncio.to_thread(_feishu.update_card, message_id, progress))
+
+            # 节流：同类进度更新 1s 一次（避免卡片 API 限流）
+            if now - last_card_update < 1.0 and ev_type not in ("compact",):
+                return
+            last_card_update = now
+
+            def _do_update(_card, _mid=message_id) -> None:
+                if done_event.is_set():
+                    return
+                _feishu.update_card(_mid, _card)
+
+            task: asyncio.Task
+            if ev_type == "compact":
+                label = "🗜️ 正在压缩上下文，稍等..."
+                if rich_mode and stop_token:
+                    card = cards.build_progress_card(collected_events, label, stop_token)
+                else:
+                    card = cards.build_text_card(label, is_thinking=True)
+                task = asyncio.ensure_future(asyncio.to_thread(_do_update, card))
+                _pending_card_tasks.append(task)
+            elif ev_type == "thinking":
+                if rich_mode and stop_token:
+                    thinking_text = ev.get("thinking", "")
+                    card = cards.build_progress_card(
+                        collected_events, "⏳ 正在思考...", stop_token,
+                        current_thinking=thinking_text,
+                    )
+                    task = asyncio.ensure_future(asyncio.to_thread(_do_update, card))
+                    _pending_card_tasks.append(task)
+                # 非 rich mode 下思考过程不展示
+            elif ev_type == "tool_use":
+                tool_name = ev.get("name", "")
+                if rich_mode and stop_token:
+                    card = cards.build_progress_card(
+                        collected_events, f"⚙️ 正在执行 {tool_name}...", stop_token,
+                    )
+                else:
+                    card = cards.build_thinking_card(f"⚙️ 正在执行 {tool_name}...", stop_token)
+                task = asyncio.ensure_future(asyncio.to_thread(_do_update, card))
+                _pending_card_tasks.append(task)
+            elif ev_type == "tool_result":
+                if rich_mode and stop_token:
+                    card = cards.build_progress_card(
+                        collected_events, "⏳ 继续处理...", stop_token,
+                    )
+                    task = asyncio.ensure_future(asyncio.to_thread(_do_update, card))
+                    _pending_card_tasks.append(task)
 
         choice_request = None
         interrupted = False
@@ -376,12 +506,19 @@ async def _process_message_async(
                 images=images if images else None,
                 files=files if files else None,
                 meta=meta,
-                on_tool_use=on_tool_use,
+                on_event=on_event,
+                max_turns=max_turns,
+                effort=effort,
             )
             reply = resp_data.get("reply", "（无回复）")
             choice_request = resp_data.get("choice_request")
-            logger.info("Agent 响应: open_id=%s reply_len=%d choice_request=%s",
-                        open_id, len(reply), choice_request is not None)
+            # on_event 回调已实时 append 到 collected_events；
+            # 若 on_event 未触发（无事件），用 resp_data["events"] 兜底
+            if not collected_events:
+                collected_events.extend(resp_data.get("events", []))
+            logger.info("Agent 响应: open_id=%s reply_len=%d choice_request=%s events=%d",
+                        open_id, len(reply), choice_request is not None, len(collected_events))
+            logger.info("TIMING agent_done open_id=%s stop_token=%s t=%s", open_id, stop_token, _bj())
         except asyncio.CancelledError:
             interrupted = True
             logger.info("任务被停止: open_id=%s stop_token=%s", open_id, stop_token)
@@ -389,8 +526,14 @@ async def _process_message_async(
             logger.error("Agent 调用失败: open_id=%s, error=%s", open_id, e)
             reply = f"❌ 服务暂时不可用，请稍后重试。\n\n`{e}`"
 
-        # Agent 调用已结束（成功/失败/中断），提前清理 stop_token。
-        # 此后点击停止按钮将因 token 不存在而静默忽略，避免打字机更新被意外取消。
+        # Agent 调用已结束，置位 done_event 阻止仍在途的进度更新写入卡片；
+        # 同时 cancel 所有待更新 Task，收集 gather 避免 "coroutine was never awaited" 警告
+        done_event.set()
+        for _t in _pending_card_tasks:
+            _t.cancel()
+        if _pending_card_tasks:
+            await asyncio.gather(*_pending_card_tasks, return_exceptions=True)
+        # 提前清理 stop_token：此后点击停止按钮将因 token 不存在而静默忽略。
         _running_tasks.pop(stop_token, None)
         _pop_pending_stop(stop_token)
 
@@ -404,13 +547,15 @@ async def _process_message_async(
             return
 
         # 3. 更新卡片（choice 或普通文字）
+        display_reply = _limit_tables(reply)
         if choice_request:
             token = str(uuid.uuid4())
             question = choice_request.get("question", "请选择：")
             choices = choice_request.get("choices", [])
             logger.info("渲染选择卡片: open_id=%s question=%r choices=%s message_id=%s",
                         open_id, question, choices, message_id)
-            card = cards.build_choice_card(reply, question, choices, token)
+            card = cards.build_choice_card(display_reply, question, choices, token,
+                                           events=collected_events if rich_mode else None)
             if message_id:
                 ok = await asyncio.to_thread(_feishu.update_card, message_id, card)
                 logger.info("update_card 结果: message_id=%s ok=%s", message_id, ok)
@@ -429,9 +574,36 @@ async def _process_message_async(
                     reply_text=reply,
                 ))
         elif message_id:
-            await _typewriter_update(message_id, reply)
+            if rich_mode and collected_events:
+                final_card = cards.build_rich_reply_card(display_reply, collected_events)
+                await asyncio.to_thread(_feishu.update_card, message_id, final_card)
+                # 进度线程可能仍在途中覆盖卡片，500ms 后重刷一次
+                async def _reguard_rich(_mid=message_id, _card=final_card) -> None:
+                    await asyncio.sleep(0.5)
+                    try:
+                        await asyncio.to_thread(_feishu.update_card, _mid, _card)
+                    except Exception:
+                        pass
+                asyncio.ensure_future(_reguard_rich())
+            else:
+                await _typewriter_update(message_id, display_reply)
+                # 进度更新线程可能在最终写入后仍短暂覆盖卡片，500ms 后重刷确保最终状态正确
+                final_card = cards.build_text_card(display_reply)
+                async def _reguard(_mid=message_id, _card=final_card) -> None:
+                    await asyncio.sleep(0.5)
+                    try:
+                        await asyncio.to_thread(_feishu.update_card, _mid, _card)
+                    except Exception:
+                        pass
+                asyncio.ensure_future(_reguard())
         else:
-            await _send_card(open_id, cards.build_text_card(reply), chat_type, source_msg_id)
+            await _send_card(open_id, cards.build_text_card(display_reply), chat_type, source_msg_id)
+
+        # 完成后给原消息加随机 emoji 表示已处理
+        if _feishu:
+            done_emoji = random.choice(["PROUD", "WITTY", "SMART", "SHOWOFF", "LGTM", "DONE"])
+            asyncio.ensure_future(asyncio.to_thread(_feishu.add_reaction, feishu_msg_id, done_emoji))
+        logger.info("TIMING card_updated open_id=%s stop_token=%s t=%s", open_id, stop_token, _bj())
 
     except Exception as e:
         logger.error("消息处理异常: open_id=%s, error=%s", open_id, e, exc_info=True)
@@ -592,6 +764,175 @@ async def _process_models_async(
             ))
     except Exception as e:
         logger.error("models 处理异常: open_id=%s error=%s", open_id, e, exc_info=True)
+
+async def _process_rich_mode_async(
+    open_id: str,
+    chat_type: str = "p2p",
+    source_msg_id: Optional[str] = None,
+) -> None:
+    """切换富文本展示模式（思考/工具折叠面板开关）。"""
+    try:
+        current = user_prefs.get_rich_mode(open_id)
+        new_val = not current
+        user_prefs.set_rich_mode(open_id, new_val)
+        mode_state = "开启 ✅" if new_val else "关闭 ⬜"
+        text = (
+            f"富文本展示模式已切换为：**{mode_state}**\n\n"
+            + ("开启后，AI 思考过程和工具调用会以折叠面板展示。" if new_val
+               else "关闭后，只显示最终文字结果（打字机效果）。")
+        )
+        await _send_card(open_id, cards.build_text_card(text), chat_type, source_msg_id)
+    except Exception as e:
+        logger.error("rich mode 切换异常: open_id=%s error=%s", open_id, e, exc_info=True)
+
+
+async def _process_thread_async(
+    open_id: str,
+    cmd: str,
+    chat_type: str = "p2p",
+    source_msg_id: Optional[str] = None,
+) -> None:
+    """查看或切换群聊话题回复模式。/thread [on|off]"""
+    try:
+        arg = cmd[7:].strip().lower()
+        current = user_prefs.get_reply_in_thread(open_id)
+        if arg == "on":
+            new_val = True
+        elif arg == "off":
+            new_val = False
+        elif arg == "":
+            new_val = not current
+        else:
+            await _send_card(open_id, cards.build_text_card("⚠️ 用法：`/thread [on|off]`"),
+                             chat_type, source_msg_id)
+            return
+        user_prefs.set_reply_in_thread(open_id, new_val)
+        state_str = "开启 ✅" if new_val else "关闭 ⬜"
+        text = (
+            f"群聊话题回复已切换为：**{state_str}**\n\n"
+            + ("开启后，在群聊中 @ 我时，回复会以「话题」方式展示在消息下方。" if new_val
+               else "关闭后，在群聊中 @ 我时，使用普通引用回复。")
+        )
+        await _send_card(open_id, cards.build_text_card(text), chat_type, source_msg_id)
+    except Exception as e:
+        logger.error("thread 切换异常: open_id=%s error=%s", open_id, e, exc_info=True)
+
+
+async def _process_turns_async(
+    open_id: str,
+    cmd: str,
+    chat_type: str = "p2p",
+    source_msg_id: Optional[str] = None,
+) -> None:
+    """查看或设置 max_turns 配置。/turns [N]"""
+    try:
+        arg = cmd[6:].strip()
+        current = user_prefs.get_max_turns(open_id)
+        if not arg:
+            text = f"当前 max_turns = **{current}**（默认 20）\n\n用法：`/turns <数字>` 设置新值（范围 1–200）"
+            await _send_card(open_id, cards.build_text_card(text), chat_type, source_msg_id)
+            return
+        try:
+            n = int(arg)
+            if n < 1 or n > 200:
+                raise ValueError
+        except ValueError:
+            await _send_card(open_id, cards.build_text_card("⚠️ 参数无效，请输入 1–200 之间的整数，例如：`/turns 50`"),
+                             chat_type, source_msg_id)
+            return
+        user_prefs.set_max_turns(open_id, n)
+        text = f"✅ max_turns 已设置为 **{n}**（原值：{current}）\n\n下次对话起生效。"
+        await _send_card(open_id, cards.build_text_card(text), chat_type, source_msg_id)
+    except Exception as e:
+        logger.error("turns 设置异常: open_id=%s cmd=%s error=%s", open_id, cmd, e, exc_info=True)
+
+
+async def _process_effort_async(
+    open_id: str,
+    cmd: str,
+    chat_type: str = "p2p",
+    source_msg_id: Optional[str] = None,
+) -> None:
+    """查看或设置 effort 配置。/effort [level]"""
+    VALID = ("low", "medium", "high", "xhigh", "max")
+    try:
+        arg = cmd[7:].strip()
+        current = user_prefs.get_effort(open_id) or "未设置（默认 high）"
+        if not arg:
+            text = f"当前 effort = **{current}**\n\n用法：`/effort <level>`\n可选值：low / medium / high / xhigh / max"
+            await _send_card(open_id, cards.build_text_card(text), chat_type, source_msg_id)
+            return
+        if arg not in VALID:
+            await _send_card(open_id, cards.build_text_card(f"⚠️ 参数无效，可选值：{', '.join(VALID)}"),
+                             chat_type, source_msg_id)
+            return
+        user_prefs.set_effort(open_id, arg)
+        text = f"✅ effort 已设置为 **{arg}**（原值：{current}）\n\n下次对话起生效。"
+        await _send_card(open_id, cards.build_text_card(text), chat_type, source_msg_id)
+    except Exception as e:
+        logger.error("effort 设置异常: open_id=%s cmd=%s error=%s", open_id, cmd, e, exc_info=True)
+
+
+_SHELL_INLINE_LIMIT = 2000  # 超过此字符数改为文件回传
+
+
+async def _process_shell_async(
+    open_id: str,
+    command: str,
+    chat_type: str = "p2p",
+    source_msg_id: Optional[str] = None,
+) -> None:
+    """直接执行 shell 命令，输出回显到飞书卡片；超长时以文件形式回传。"""
+    try:
+        thinking_card = cards.build_text_card("⏳ 正在执行...", is_thinking=True)
+        message_id = await _send_card(open_id, thinking_card, chat_type, source_msg_id)
+        try:
+            proc = await asyncio.create_subprocess_shell(
+                command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                cwd=assistant.WORKSPACE,
+            )
+            try:
+                stdout_b, _ = await asyncio.wait_for(proc.communicate(), timeout=60.0)
+            except asyncio.TimeoutError:
+                proc.kill()
+                stdout_b = "[超时，命令已终止]".encode()
+            stdout = stdout_b.decode(errors="replace")
+            exit_code = proc.returncode or 0
+            status = "✅" if exit_code == 0 else f"❌ (exit {exit_code})"
+
+            if len(stdout) > _SHELL_INLINE_LIMIT:
+                preview = stdout[:300].strip()
+                summary = f"{status} `{command}`\n\n输出共 {len(stdout)} 字节，已作为文件发送。\n\n**预览：**\n```\n{preview}\n…\n```"
+                card = cards.build_text_card(summary)
+                if message_id:
+                    await asyncio.to_thread(_feishu.update_card, message_id, card)
+                else:
+                    await _send_card(open_id, card, chat_type, source_msg_id)
+                safe_cmd = re.sub(r"[^\w\-]", "_", command[:40])
+                file_name = f"shell_{safe_cmd}.txt"
+                file_key = await asyncio.to_thread(_feishu.upload_text_as_file, stdout, file_name)
+                if file_key:
+                    in_thread = user_prefs.get_reply_in_thread(open_id)
+                    if chat_type == "group" and source_msg_id:
+                        await asyncio.to_thread(_feishu.reply_file_to_message, source_msg_id, file_key, in_thread)
+                    else:
+                        await asyncio.to_thread(_feishu.send_file_to_open_id, open_id, file_key)
+                return
+
+            output = stdout.strip() or "(无输出)"
+            reply = f"{status} `{command}`\n\n```\n{output}\n```"
+        except Exception as e:
+            reply = f"❌ 执行失败。\n\n`{e}`"
+        card = cards.build_text_card(reply)
+        if message_id:
+            await asyncio.to_thread(_feishu.update_card, message_id, card)
+        else:
+            await _send_card(open_id, card, chat_type, source_msg_id)
+    except Exception as e:
+        logger.error("shell 处理异常: open_id=%s command=%s error=%s", open_id, command, e, exc_info=True)
+
 
 def _on_card_action(data: P2CardActionTrigger) -> P2CardActionTriggerResponse:
     """飞书卡片按钮点击回调，必须在超时前返回响应。"""
@@ -766,6 +1107,53 @@ async def _handle_switch_model_action_async(
     return resp
 
 
+# ──────────────────────── 机器人菜单 ─────────────────────────────
+# 飞书开放平台 → 应用 → 机器人 → 机器人菜单 中配置各项，event_key 与下表对应：
+#
+#  event_key       菜单文字（建议）    触发行为
+#  ─────────────────────────────────────────────────────
+#  help            帮助 / 指令手册    显示 /help 卡片
+#  new_session     新建对话           清空历史 /new
+#  sessions        历史会话           /sessions 切换卡片
+#  models          切换模型           /models 切换卡片
+#  toggle_rich     富文本模式         /rich 开关
+#
+# 在后台添加菜单项后，用户点击即触发 p2.application.bot.menu_v6 事件。
+
+def _on_bot_menu(data) -> None:
+    """飞书机器人菜单点击回调。"""
+    try:
+        event = getattr(data, "event", None)
+        if not event:
+            return
+        event_key: str = getattr(event, "event_key", "") or ""
+        operator = getattr(event, "operator", None)
+        # operator.operator_id 是 UserId 对象，需要取其 .open_id 字段
+        operator_id_obj = getattr(operator, "operator_id", None)
+        open_id: Optional[str] = getattr(operator_id_obj, "open_id", None)
+        if not open_id:
+            logger.warning("bot_menu: 无法获取 open_id, event_key=%s", event_key)
+            return
+
+        logger.info("bot_menu: open_id=%s event_key=%s", open_id, event_key)
+
+        # 菜单项 → 对应的处理协程（私聊模式，chat_type=p2p，source_msg_id=None）
+        if event_key == "help":
+            _submit(_send_card(open_id, cards.build_help_card(), "p2p", None))
+        elif event_key == "new_session":
+            _submit(_process_reset_async(open_id, "p2p", None))
+        elif event_key == "sessions":
+            _submit(_process_sessions_async(open_id, "p2p", None))
+        elif event_key == "models":
+            _submit(_process_models_async(open_id, "p2p", None))
+        elif event_key == "toggle_rich":
+            _submit(_process_rich_mode_async(open_id, "p2p", None))
+        else:
+            logger.info("bot_menu: 未知 event_key=%s，忽略", event_key)
+    except Exception as e:
+        logger.error("bot_menu 处理异常: %s", e, exc_info=True)
+
+
 def _on_message_receive(data: P2ImMessageReceiveV1) -> None:
     """飞书 im.message.receive_v1 事件回调（必须在 3s 内返回）。"""
     message = data.event.message
@@ -787,6 +1175,13 @@ def _on_message_receive(data: P2ImMessageReceiveV1) -> None:
         if msg_type == "text":
             text = content.get("text", "").strip()
         elif msg_type == "post":
+            # post 消息中也要过滤 @所有人（富文本 at 元素 user_id == "@_all"）
+            post_rows = (content.get("zh_cn") or content.get("en_us") or content).get("content", [])
+            for row in post_rows:
+                for item in row:
+                    if item.get("tag") == "at" and item.get("user_id") == "@_all":
+                        logger.debug("忽略 @所有人 post 消息: %s", message.message_id)
+                        return
             text, image_keys = _extract_post_content(content)
         elif msg_type == "image":
             key = content.get("image_key", "")
@@ -846,6 +1241,7 @@ def _on_message_receive(data: P2ImMessageReceiveV1) -> None:
 
     logger.info("收到消息: sender=%s, chat_type=%s, type=%s, text=%.80s, images=%d",
                 open_id, chat_type, msg_type, text, len(image_keys))
+    logger.info("TIMING recv open_id=%s msg_id=%s t=%s", open_id, source_msg_id, _bj())
 
     # 斜杠指令
     cmd = text.strip()
@@ -863,6 +1259,25 @@ def _on_message_receive(data: P2ImMessageReceiveV1) -> None:
         return
     if cmd in ("/compact", "/context"):
         _submit(_process_slash_async(open_id, cmd, chat_type, source_msg_id))
+        return
+    if cmd == "/rich":
+        _submit(_process_rich_mode_async(open_id, chat_type, source_msg_id))
+        return
+    if cmd == "/thread" or cmd.startswith("/thread "):
+        _submit(_process_thread_async(open_id, cmd, chat_type, source_msg_id))
+        return
+    if cmd == "/turns" or cmd.startswith("/turns "):
+        _submit(_process_turns_async(open_id, cmd, chat_type, source_msg_id))
+        return
+    if cmd == "/effort" or cmd.startswith("/effort "):
+        _submit(_process_effort_async(open_id, cmd, chat_type, source_msg_id))
+        return
+    if cmd.startswith("/shell "):
+        shell_cmd = cmd[7:].strip()
+        if shell_cmd:
+            _submit(_process_shell_async(open_id, shell_cmd, chat_type, source_msg_id))
+        else:
+            _submit(_send_card(open_id, cards.build_text_card("⚠️ 用法：`/shell <命令>`"), chat_type, source_msg_id))
         return
     # /save <name> — 给当前 session 保存别名
     if cmd.startswith("/save "):
@@ -902,6 +1317,9 @@ def start(app_id: str, app_secret: str) -> None:
         lark.EventDispatcherHandler.builder("", "")
         .register_p2_im_message_receive_v1(_on_message_receive)
         .register_p2_im_message_message_read_v1(lambda _: None)
+        .register_p2_im_message_reaction_created_v1(lambda _: None)
+        .register_p2_im_message_reaction_deleted_v1(lambda _: None)
+        .register_p2_application_bot_menu_v6(_on_bot_menu)
         .register_p2_card_action_trigger(_on_card_action)
         .build()
     )

@@ -10,8 +10,13 @@ from typing import Optional
 import lark_oapi as lark
 from lark_oapi.api.contact.v3 import GetUserRequest
 from lark_oapi.api.im.v1 import (
+    CreateFileRequest,
+    CreateFileRequestBody,
+    CreateMessageReactionRequest,
+    CreateMessageReactionRequestBody,
     CreateMessageRequest,
     CreateMessageRequestBody,
+    DeleteMessageRequest,
     GetMessageRequest,
     GetMessageResourceRequest,
     PatchMessageRequest,
@@ -19,6 +24,7 @@ from lark_oapi.api.im.v1 import (
     ReplyMessageRequest,
     ReplyMessageRequestBody,
 )
+from lark_oapi.api.im.v1.model import Emoji
 
 logger = logging.getLogger(__name__)
 
@@ -111,6 +117,9 @@ class FeishuClient:
     def get_message(self, message_id: str) -> Optional[dict]:
         """获取指定消息内容。返回 {msg_type, content, message_id}；失败返回 None。"""
         request = GetMessageRequest.builder().message_id(message_id).build()
+        # card_msg_content_type=user_card_content：获取 schema 2.0 卡片的原始 JSON
+        # 不加此参数时，飞书对 schema 2.0 卡片返回降级的图片格式，内容为空
+        request.add_query("card_msg_content_type", "user_card_content")
         response = self._client.im.v1.message.get(request)
         if not response.success():
             logger.error(
@@ -130,15 +139,14 @@ class FeishuClient:
         }
 
     def resolve_quoted_content(self, message_id: str) -> dict:
-        """解析被引用消息的内容。返回 {text, image_keys, file_tuples, quoted_msg_id}。
-        不支持的类型（interactive 等）返回空结果，不影响主流程。
-        """
+        """解析被引用消息的内容。返回 {text, image_keys, file_tuples, quoted_msg_id}。"""
         empty: dict = {"text": "", "image_keys": [], "file_tuples": [], "quoted_msg_id": message_id}
         msg = self.get_message(message_id)
         if not msg:
             return empty
         msg_type = msg["msg_type"]
         quoted_msg_id = msg["message_id"]
+        logger.info("resolve_quoted_content: message_id=%s msg_type=%s", message_id, msg_type)
         try:
             content = json.loads(msg["content"])
         except (json.JSONDecodeError, TypeError):
@@ -156,8 +164,84 @@ class FeishuClient:
             file_key = content.get("file_key", "")
             file_name = content.get("file_name", "unnamed_file")
             return {"text": "", "image_keys": [], "file_tuples": [(file_key, file_name)] if file_key else [], "quoted_msg_id": quoted_msg_id}
+        elif msg_type == "interactive":
+            text = self._parse_interactive_card_content(content)
+            image_keys = self._extract_interactive_fallback_images(content)
+            return {"text": text, "image_keys": image_keys, "file_tuples": [], "quoted_msg_id": quoted_msg_id}
         else:
             return {**empty, "quoted_msg_id": quoted_msg_id}
+
+    @staticmethod
+    def _parse_interactive_card_content(content: dict) -> str:
+        """从 interactive 消息卡片中提取可读文本。支持 schema 2.0 和旧版卡片格式。"""
+        if "card" in content and isinstance(content["card"], dict):
+            content = content["card"]
+
+        parts: list[str] = []
+
+        header = content.get("header", {})
+        title_obj = header.get("title", {}) if isinstance(header, dict) else {}
+        if isinstance(title_obj, dict):
+            if t := title_obj.get("content", "").strip():
+                parts.append(f"[卡片标题: {t}]")
+
+        # schema 2.0: body.elements
+        body = content.get("body", {})
+        if isinstance(body, dict):
+            FeishuClient._extract_elements_text(body.get("elements", []), parts)
+
+        # 旧格式: 顶层 elements
+        if top := content.get("elements", []):
+            FeishuClient._extract_elements_text(top, parts)
+
+        return "\n".join(parts).strip()
+
+    @staticmethod
+    def _extract_elements_text(elements: list, parts: list[str]) -> None:
+        """递归提取 elements 中的文本内容。折叠面板只取标题，跳过内部细节。"""
+        for elem in elements:
+            if not isinstance(elem, dict):
+                continue
+            tag = elem.get("tag", "")
+            if tag == "markdown":
+                if c := elem.get("content", "").strip():
+                    parts.append(c)
+            elif tag in ("plain_text", "lark_md"):
+                if c := elem.get("content", "").strip():
+                    parts.append(c)
+            elif tag == "div":
+                text_obj = elem.get("text", {})
+                if isinstance(text_obj, dict):
+                    if c := text_obj.get("content", "").strip():
+                        parts.append(c)
+                for field in elem.get("fields", []):
+                    t = field.get("text", {}) if isinstance(field, dict) else {}
+                    if isinstance(t, dict):
+                        if c := t.get("content", "").strip():
+                            parts.append(c)
+            elif tag == "collapsible_panel":
+                ph = elem.get("header", {})
+                pt = ph.get("title", {}) if isinstance(ph, dict) else {}
+                if isinstance(pt, dict):
+                    if c := pt.get("content", "").strip():
+                        parts.append(f"[折叠: {c}]")
+
+    @staticmethod
+    def _extract_interactive_fallback_images(content: dict) -> list[str]:
+        """提取飞书对 schema 2.0 卡片的降级格式中的图片 key（兜底方案）。
+        降级格式：{"title": null, "elements": [[{"tag": "img", "image_key": "..."}]]}
+        """
+        actual = content.get("card", content) if "card" in content else content
+        if "body" in actual or "schema" in actual:
+            return []
+        image_keys: list[str] = []
+        for paragraph in actual.get("elements", []):
+            if isinstance(paragraph, list):
+                for elem in paragraph:
+                    if isinstance(elem, dict) and elem.get("tag") == "img":
+                        if key := elem.get("image_key", ""):
+                            image_keys.append(key)
+        return image_keys
 
     @staticmethod
     def _parse_post_content(content: dict) -> tuple[str, list[str]]:
@@ -243,17 +327,19 @@ class FeishuClient:
         )
         return None
 
-    def reply_card_to_message(self, origin_message_id: str, card: dict) -> Optional[str]:
+    def reply_card_to_message(self, origin_message_id: str, card: dict, in_thread: bool = False) -> Optional[str]:
         """回复指定消息（群聊场景），返回回复消息的 message_id；失败返回 None。"""
+        body_builder = (
+            ReplyMessageRequestBody.builder()
+            .msg_type("interactive")
+            .content(json.dumps(card, ensure_ascii=False))
+        )
+        if in_thread:
+            body_builder = body_builder.reply_in_thread(True)
         request = (
             ReplyMessageRequest.builder()
             .message_id(origin_message_id)
-            .request_body(
-                ReplyMessageRequestBody.builder()
-                .msg_type("interactive")
-                .content(json.dumps(card, ensure_ascii=False))
-                .build()
-            )
+            .request_body(body_builder.build())
             .build()
         )
         response = self._client.im.v1.message.reply(request)
@@ -266,6 +352,98 @@ class FeishuClient:
             origin_message_id, response.code, response.msg,
         )
         return None
+
+    def add_reaction(self, message_id: str, emoji_type: str = "OneSecond") -> bool:
+        """给指定消息添加表情回复。"""
+        request = (
+            CreateMessageReactionRequest.builder()
+            .message_id(message_id)
+            .request_body(
+                CreateMessageReactionRequestBody.builder()
+                .reaction_type(Emoji.builder().emoji_type(emoji_type).build())
+                .build()
+            )
+            .build()
+        )
+        response = self._client.im.v1.message_reaction.create(request)
+        if response.success():
+            return True
+        logger.warning("添加表情回复失败: message_id=%s, code=%s, msg=%s",
+                       message_id, response.code, response.msg)
+        return False
+
+    def upload_text_as_file(self, content: str, file_name: str) -> Optional[str]:
+        """将文本内容上传为飞书文件，返回 file_key；失败返回 None。"""
+        import io
+        raw = content.encode("utf-8")
+        request = (
+            CreateFileRequest.builder()
+            .request_body(
+                CreateFileRequestBody.builder()
+                .file_type("stream")
+                .file_name(file_name)
+                .file(io.BytesIO(raw))
+                .build()
+            )
+            .build()
+        )
+        response = self._client.im.v1.file.create(request)
+        if response.success():
+            return response.data.file_key
+        logger.error("文件上传失败: code=%s, msg=%s", response.code, response.msg)
+        return None
+
+    def send_file_to_open_id(self, open_id: str, file_key: str) -> bool:
+        """向 open_id 发送文件消息。"""
+        request = (
+            CreateMessageRequest.builder()
+            .receive_id_type("open_id")
+            .request_body(
+                CreateMessageRequestBody.builder()
+                .receive_id(open_id)
+                .msg_type("file")
+                .content(json.dumps({"file_key": file_key}, ensure_ascii=False))
+                .build()
+            )
+            .build()
+        )
+        response = self._client.im.v1.message.create(request)
+        if response.success():
+            return True
+        logger.error("文件消息发送失败: open_id=%s, code=%s, msg=%s", open_id, response.code, response.msg)
+        return False
+
+    def reply_file_to_message(self, message_id: str, file_key: str, in_thread: bool = False) -> bool:
+        """回复文件消息到指定消息。"""
+        body_builder = (
+            ReplyMessageRequestBody.builder()
+            .msg_type("file")
+            .content(json.dumps({"file_key": file_key}, ensure_ascii=False))
+        )
+        if in_thread:
+            body_builder = body_builder.reply_in_thread(True)
+        request = (
+            ReplyMessageRequest.builder()
+            .message_id(message_id)
+            .request_body(body_builder.build())
+            .build()
+        )
+        response = self._client.im.v1.message.reply(request)
+        if response.success():
+            return True
+        logger.error("文件回复失败: message_id=%s, code=%s, msg=%s", message_id, response.code, response.msg)
+        return False
+
+    def recall_message(self, message_id: str) -> bool:
+        """撤回指定消息（Bot 只能撤回自己发的消息，发送后 24 小时内有效）。"""
+        request = DeleteMessageRequest.builder().message_id(message_id).build()
+        response = self._client.im.v1.message.delete(request)
+        if response.success():
+            logger.info("消息撤回成功: message_id=%s", message_id)
+            return True
+        logger.error("消息撤回失败: message_id=%s, code=%s, msg=%s",
+                     message_id, response.code, response.msg)
+        return False
 
     def update_card(self, message_id: str, card: dict) -> bool:
         """更新已发送的消息卡片内容。"""
