@@ -103,7 +103,12 @@ cp .env.example .env
 
 **机器人菜单（可选）：**
 
-在「机器人 → 机器人菜单」中添加快捷菜单，响应动作选「推送事件」，event_key 对应关系：
+用户在私聊机器人时顶部会出现快捷菜单按钮。配置步骤：
+
+1. 飞书开放平台 → 应用功能 → **机器人** → **机器人菜单** → 添加菜单项
+2. 每个菜单项的「响应动作」选 **推送事件**，填入下表对应的 `event_key`
+3. 确保「事件订阅」中已添加 `application.bot.menu_v6` 事件（见上方）
+4. **发布新版本**后菜单才会对用户生效
 
 | event_key | 菜单文字（建议） | 触发行为 |
 |-----------|----------------|---------|
@@ -141,22 +146,30 @@ uv run python -m src
 ## 项目结构
 
 ```
-src/
-├── main.py                  # 入口，加载 .env，启动 bot
-├── agent/
-│   ├── assistant.py         # Claude SDK 封装（对话 / 工具调用 / lark-cli）
-│   ├── session.py           # 会话管理（open_id → session_id 持久化）
-│   └── prefs.py             # 用户偏好持久化（rich_mode / turns / effort 等）
-└── feishu/
-    ├── bot.py               # 飞书 WebSocket 消息处理 + 所有指令路由
-    ├── card.py              # 飞书卡片构建（进度卡片 / 富文本卡片 / 选择卡片等）
-    └── feishu_client.py     # 飞书 API 客户端（消息 / 文件 / 表情 / 撤回等）
-workspace/                   # Agent 工作目录（运行时生成，不提交到 git）
-├── uploads/                 # 用户上传的文件
-├── .sessions.json           # 会话映射持久化
-├── .user_prefs.json         # 用户偏好持久化
-├── .agent_env               # 运行时环境变量（重启后自动加载）
-└── .claude/                 # Claude Code 配置（settings.json / skills / commands）
+.
+├── src/
+│   ├── main.py              # 入口：加载 .env，初始化，启动 bot
+│   ├── __main__.py          # python -m src 入口
+│   ├── agent/
+│   │   ├── assistant.py     # Claude SDK 封装（对话 / 工具调用 / lark-cli 配置）
+│   │   ├── session.py       # 会话管理（open_id → session_id 持久化）
+│   │   └── prefs.py         # 用户偏好持久化（rich_mode / turns / effort 等）
+│   └── feishu/
+│       ├── bot.py           # 飞书 WebSocket 消息处理 + 所有指令路由
+│       ├── card.py          # 飞书卡片构建（进度 / 富文本 / 选择 / 会话 / 模型）
+│       └── feishu_client.py # 飞书 API 客户端（消息 / 文件 / 表情 / 撤回等）
+├── workspace/               # Agent 工作目录（不提交到 git）
+│   ├── uploads/             # 用户上传的文件（自动保存）
+│   ├── .sessions.json       # 会话映射持久化（自动生成）
+│   ├── .user_prefs.json     # 用户偏好持久化（自动生成）
+│   ├── .agent_env           # 运行时额外环境变量（重启后自动加载）
+│   └── .claude/
+│       ├── settings.json    # Claude Code 配置（模型 / 权限白名单）
+│       ├── skills/          # 已安装的 Skill（如 tavily-search）
+│       └── commands/        # 自定义 Slash Command
+├── .env                     # 本地环境变量（不提交到 git）
+├── .env.example             # 环境变量模板
+└── pyproject.toml           # 项目依赖（uv 管理）
 ```
 
 ---
