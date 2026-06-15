@@ -1270,6 +1270,8 @@ def start(app_id: str, app_secret: str) -> None:
         lark.EventDispatcherHandler.builder("", "")
         .register_p2_im_message_receive_v1(_on_message_receive)
         .register_p2_im_message_message_read_v1(lambda _: None)
+        .register_p2_im_message_reaction_created_v1(lambda _: None)
+        .register_p2_im_message_reaction_deleted_v1(lambda _: None)
         .register_p2_card_action_trigger(_on_card_action)
         .build()
     )
