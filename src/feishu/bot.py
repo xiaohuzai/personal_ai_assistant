@@ -1173,7 +1173,11 @@ def _on_message_receive(data: P2ImMessageReceiveV1) -> None:
         image_keys: list[str] = []
         file_tuples: list[tuple[str, str]] = []
         if msg_type == "text":
-            text = content.get("text", "").strip()
+            raw_text = content.get("text", "")
+            if "@_all" in raw_text:
+                logger.debug("忽略 @所有人 消息: %s", message.message_id)
+                return
+            text = raw_text.strip()
         elif msg_type == "post":
             # post 消息中也要过滤 @所有人（富文本 at 元素 user_id == "@_all"）
             post_rows = (content.get("zh_cn") or content.get("en_us") or content).get("content", [])

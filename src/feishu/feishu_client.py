@@ -10,6 +10,8 @@ from typing import Optional
 import lark_oapi as lark
 from lark_oapi.api.contact.v3 import GetUserRequest
 from lark_oapi.api.im.v1 import (
+    CreateChatMembersRequest,
+    CreateChatMembersRequestBody,
     CreateFileRequest,
     CreateFileRequestBody,
     CreateMessageReactionRequest,
@@ -58,6 +60,29 @@ class FeishuClient:
             "name": getattr(user, "name", ""),
             "email": getattr(user, "email", "") or getattr(user, "enterprise_email", ""),
         }
+
+    def add_user_to_chat(self, chat_id: str, open_id: str) -> bool:
+        """将用户加入指定群（幂等，已在群里时也返回 True）。失败返回 False。"""
+        body = (
+            CreateChatMembersRequestBody.builder()
+            .id_list([open_id])
+            .build()
+        )
+        request = (
+            CreateChatMembersRequest.builder()
+            .chat_id(chat_id)
+            .member_id_type("open_id")
+            .request_body(body)
+            .build()
+        )
+        response = self._client.im.v1.chat_members.create(request)
+        if not response.success():
+            logger.warning(
+                "加群失败: chat_id=%s open_id=%s code=%s msg=%s",
+                chat_id, open_id, response.code, response.msg,
+            )
+            return False
+        return True
 
     # ------------------------------------------------------------------ 图片 / 文件
 
